@@ -1,0 +1,19 @@
+# macOS artifacts
+.DS_Store
+
+# Swift Package Manager build products and state
+/.build/
+/Packages
+.swiftpm/
+
+# Xcode build outputs and user data
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+
+# Compiler caches
+/.clang-module-cache/
+
+# Credentials
+.netrc
