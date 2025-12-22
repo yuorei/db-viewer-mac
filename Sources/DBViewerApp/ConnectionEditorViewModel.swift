@@ -89,7 +89,18 @@ final class ConnectionEditorViewModel: ObservableObject, Identifiable {
     }
 
     var isValid: Bool {
-        !name.isEmpty && !host.isEmpty && !database.isEmpty && !username.isEmpty && Int(port) != nil
+        if name.isEmpty {
+            return false
+        }
+
+        switch engine {
+        case .sqlite:
+            // SQLiteはファイルパス（database）のみ必須
+            return !database.isEmpty
+        case .postgres, .mysql:
+            // PostgreSQL/MySQLはhost, database, username, portが必須
+            return !host.isEmpty && !database.isEmpty && !username.isEmpty && Int(port) != nil
+        }
     }
 
     var requiresPassword: Bool {
