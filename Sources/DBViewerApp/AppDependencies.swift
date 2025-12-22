@@ -3,33 +3,26 @@ import DBViewerCore
 
 struct AppDependencies {
     var connectionStore: any ConnectionStore
-    var keychain: any KeychainService
     var driverRegistry: DatabaseDriverRegistry
-    var keychainServiceName: String
 
     static func live() -> AppDependencies {
-        let keychain = DefaultKeychainService()
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? URL(fileURLWithPath: NSTemporaryDirectory())
         let directory = appSupport.appending(path: "DBViewer")
-        let fileURL = directory.appending(path: "connections.json.enc")
-        let configuration = ConnectionStoreConfiguration(
-            storageURL: fileURL,
-            keychainServiceName: "com.yuorei.dbviewer"
-        )
-        let store = FileConnectionStore(configuration: configuration, keychain: keychain)
+        let fileURL = directory.appending(path: "connections.json")
+        let configuration = ConnectionStoreConfiguration(storageURL: fileURL)
+        let store = FileConnectionStore(configuration: configuration)
 
-        let dataset = sampleDataset()
+        // Use real database drivers instead of in-memory drivers with sample data
         let driverRegistry = DatabaseDriverRegistry(drivers: [
-            InMemoryDriver(engine: .postgres, dataset: dataset),
-            InMemoryDriver(engine: .mysql, dataset: dataset),
-            InMemoryDriver(engine: .sqlite, dataset: dataset)
+            PostgreSQLDriver(),
+            MySQLDriver(),
+            SQLiteDriver()
         ])
 
-        return AppDependencies(connectionStore: store, keychain: keychain, driverRegistry: driverRegistry, keychainServiceName: configuration.keychainServiceName)
+        return AppDependencies(connectionStore: store, driverRegistry: driverRegistry)
     }
 
     static func preview() -> AppDependencies {
-        let keychain = InMemoryKeychainService()
         let sampleProfile = ConnectionProfile(
             name: "Local PostgreSQL",
             engine: .postgres,
@@ -37,22 +30,27 @@ struct AppDependencies {
             port: 5432,
             database: "postgres",
             username: "postgres",
-            credential: .init(storage: .keychain(id: "preview-postgres"))
+            credential: .init(storage: .inline("postgres"))
         )
-        try? keychain.storePassword("postgres", account: "preview-postgres", service: "preview")
         let store = InMemoryConnectionStore(items: [sampleProfile])
 
+        // Use sample dataset for preview only
         let dataset = sampleDataset()
         let driverRegistry = DatabaseDriverRegistry(drivers: [
             InMemoryDriver(engine: .postgres, dataset: dataset)
         ])
 
-        return AppDependencies(connectionStore: store, keychain: keychain, driverRegistry: driverRegistry, keychainServiceName: "preview")
+        return AppDependencies(connectionStore: store, driverRegistry: driverRegistry)
     }
 
     @MainActor
     func makeConnectionListViewModel() -> ConnectionListViewModel {
-        ConnectionListViewModel(dependencies: .init(connectionStore: connectionStore, keychain: keychain, keychainServiceName: keychainServiceName), driverRegistry: driverRegistry)
+        ConnectionListViewModel(dependencies: .init(connectionStore: connectionStore), driverRegistry: driverRegistry)
+    }
+
+    @MainActor
+    func makeConnectionEditorViewModel(mode: ConnectionEditorViewModel.Mode) -> ConnectionEditorViewModel {
+        ConnectionEditorViewModel(mode: mode, driverRegistry: driverRegistry)
     }
 }
 

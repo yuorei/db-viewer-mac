@@ -115,6 +115,150 @@ public extension DatabaseSession {
     func execute(sql: String) async throws -> SQLQueryResult {
         try await execute(sql: sql, limit: nil)
     }
+    
+    func generateBackupSQL(for tables: [DatabaseTable]? = nil) async throws -> String {
+        // If no tables specified, backup all tables
+        let tablesToBackup: [DatabaseTable]
+        if let tables = tables {
+            tablesToBackup = tables
+        } else {
+            // Get all tables from all schemas
+            let schemas = try await listSchemas()
+            tablesToBackup = try await withThrowingTaskGroup(of: [DatabaseTable].self) { group in
+                for schema in schemas {
+                    group.addTask {
+                        try await self.listTables(in: schema.name)
+                    }
+                }
+                
+                var allTables: [DatabaseTable] = []
+                for try await tables in group {
+                    allTables.append(contentsOf: tables)
+                }
+                return allTables
+            }
+        }
+        
+        var backupSQL = ""
+        
+        // Add header comment
+        backupSQL += "-- Database Backup Generated: \(ISO8601DateFormatter().string(from: Date()))\n"
+        backupSQL += "-- Connection: \(profile.name)\n"
+        backupSQL += "-- Engine: \(profile.engine.displayName)\n\n"
+        
+        // Generate backup for each table
+        for table in tablesToBackup {
+            do {
+                backupSQL += try await generateTableBackupSQL(for: table)
+                backupSQL += "\n"
+            } catch {
+                // Add comment about failed table
+                backupSQL += "-- Failed to backup table \(table.fullyQualifiedName): \(error.localizedDescription)\n\n"
+            }
+        }
+        
+        return backupSQL
+    }
+    
+    private func generateTableBackupSQL(for table: DatabaseTable) async throws -> String {
+        var sql = ""
+        
+        // Add table comment
+        sql += "-- Table: \(table.fullyQualifiedName)\n"
+        
+        // Get table structure
+        let columns = try await describe(table: table)
+        
+        // Generate CREATE TABLE statement (simplified version)
+        sql += generateCreateTableSQL(for: table, columns: columns)
+        sql += "\n\n"
+        
+        // Get all data from the table
+        let dataQuery = DataQueryRequest(table: table, limit: Int.max)
+        let dataPage = try await execute(query: dataQuery)
+        
+        if !dataPage.rows.isEmpty {
+            // Generate INSERT statements
+            let columnNames = columns.map { $0.name }
+            let quotedColumnNames = columnNames.map { escapeIdentifier($0) }.joined(separator: ", ")
+            
+            sql += "-- Data for table \(table.fullyQualifiedName)\n"
+            
+            for row in dataPage.rows {
+                let values = columnNames.map { columnName in
+                    formatValueForSQL(row.cells[columnName])
+                }.joined(separator: ", ")
+                
+                sql += "INSERT INTO \(escapeIdentifier(table.schema)).\(escapeIdentifier(table.name)) (\(quotedColumnNames)) VALUES (\(values));\n"
+            }
+        } else {
+            sql += "-- No data in table \(table.fullyQualifiedName)\n"
+        }
+        
+        return sql
+    }
+    
+    private func generateCreateTableSQL(for table: DatabaseTable, columns: [DatabaseColumn]) -> String {
+        let tableName = "\(escapeIdentifier(table.schema)).\(escapeIdentifier(table.name))"
+        
+        var sql = "CREATE TABLE \(tableName) (\n"
+        
+        let columnDefinitions = columns.map { column in
+            var def = "    \(escapeIdentifier(column.name)) \(column.dataType)"
+            
+            if !column.isNullable {
+                def += " NOT NULL"
+            }
+            
+            if let defaultValue = column.defaultValue {
+                def += " DEFAULT \(defaultValue)"
+            }
+            
+            return def
+        }
+        
+        sql += columnDefinitions.joined(separator: ",\n")
+        sql += "\n);"
+        
+        return sql
+    }
+    
+    private func escapeIdentifier(_ identifier: String) -> String {
+        // Simple identifier escaping - should be customized per database engine
+        return "\"\(identifier)\""
+    }
+    
+    private func formatValueForSQL(_ value: DatabaseValue?) -> String {
+        guard let value = value else {
+            return "NULL"
+        }
+        
+        switch value {
+        case .null:
+            return "NULL"
+        case .bool(let b):
+            return b ? "TRUE" : "FALSE"
+        case .int(let i):
+            return String(i)
+        case .double(let d):
+            return String(d)
+        case .decimal(let s):
+            return s
+        case .string(let s):
+            return "'\(s.replacingOccurrences(of: "'", with: "''"))'"
+        case .date(let date):
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withDashSeparatorInDate]
+            return "'\(formatter.string(from: date))'"
+        case .timestamp(let date):
+            let formatter = ISO8601DateFormatter()
+            return "'\(formatter.string(from: date))'"
+        case .blob(let data):
+            return "'\(data.base64EncodedString())'"
+        case .json(let json):
+            return "'\(json.replacingOccurrences(of: "'", with: "''"))'"
+        }
+    }
 }
 
 public protocol DatabaseDriver: Sendable {

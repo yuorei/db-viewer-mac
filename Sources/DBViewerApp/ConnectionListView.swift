@@ -161,6 +161,7 @@ private struct ConnectionDetailView: View {
                             onRefresh: viewModel.refreshSelectedTable,
                             onLoadMore: viewModel.loadMoreRows,
                             onBackup: viewModel.exportSelectedTableBackup,
+                            onBackupAll: viewModel.exportAllTablesBackup,
                             onAddRow: viewModel.startCreatingRow,
                             onEditRow: viewModel.startEditingSelectedRow,
                             onDeleteRows: viewModel.deleteSelectedRows
@@ -174,6 +175,18 @@ private struct ConnectionDetailView: View {
                 case .sql:
                     SQLConsoleView(viewModel: viewModel.sqlConsoleViewModel)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                case .backup:
+                    if let backupViewModel = viewModel.backupViewModel {
+                        DatabaseBackupView(viewModel: backupViewModel)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    } else {
+                        VStack {
+                            Spacer()
+                            Text("バックアップ機能が利用できません")
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                    }
                 }
             }
             .padding()
@@ -200,6 +213,7 @@ private struct TableDataSection: View {
     let onRefresh: () -> Void
     let onLoadMore: () -> Void
     let onBackup: () -> Void
+    let onBackupAll: () -> Void
     let onAddRow: () -> Void
     let onEditRow: () -> Void
     let onDeleteRows: () -> Void
@@ -220,14 +234,17 @@ private struct TableDataSection: View {
                 }
                 .disabled(isLoading)
                 Button(action: onBackup) {
-                    if isExportingBackup {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Label("バックアップ", systemImage: "square.and.arrow.down")
-                    }
+                    Label("バックアップ", systemImage: "square.and.arrow.down")
                 }
                 .disabled(isLoading || isExportingBackup)
+                Button(action: onBackupAll) {
+                    Label("全テーブルをバックアップ", systemImage: "tray.and.arrow.down")
+                }
+                .disabled(isLoading || isExportingBackup)
+                if isExportingBackup {
+                    ProgressView()
+                        .controlSize(.small)
+                }
                 Menu {
                     Button(action: onAddRow) {
                         Label("行を追加", systemImage: "plus")
@@ -350,8 +367,4 @@ private struct DataGridView: View {
         onActivateRow()
     }
 }
-#if canImport(PreviewsMacros)
-#Preview {
-    ConnectionListView(viewModel: AppDependencies.preview().makeConnectionListViewModel())
-}
-#endif
+

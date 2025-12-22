@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 public protocol ConnectionStore: Sendable {
     func loadConnections() async throws -> [ConnectionProfile]
@@ -10,28 +9,23 @@ public protocol ConnectionStore: Sendable {
 
 public struct ConnectionStoreConfiguration: Sendable {
     public var storageURL: URL
-    public var keychainServiceName: String
 
-    public init(storageURL: URL, keychainServiceName: String) {
+    public init(storageURL: URL) {
         self.storageURL = storageURL
-        self.keychainServiceName = keychainServiceName
     }
 }
 
 public final class FileConnectionStore: ConnectionStore, @unchecked Sendable {
     private let configuration: ConnectionStoreConfiguration
-    private let keychain: KeychainService
     private let fileManager: FileManager
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
     public init(
         configuration: ConnectionStoreConfiguration,
-        keychain: KeychainService,
         fileManager: FileManager = .default
     ) {
         self.configuration = configuration
-        self.keychain = keychain
         self.fileManager = fileManager
 
         let encoder = JSONEncoder()
@@ -46,24 +40,16 @@ public final class FileConnectionStore: ConnectionStore, @unchecked Sendable {
             return []
         }
 
-        let encrypted = try Data(contentsOf: configuration.storageURL)
-        guard let sealedBox = try? AES.GCM.SealedBox(combined: encrypted) else {
-            throw ConnectionStoreError.invalidPayload
-        }
-
-        let key = try obtainEncryptionKey()
-        let decrypted = try AES.GCM.open(sealedBox, using: key)
-        let document = try decoder.decode(ConnectionDocument.self, from: decrypted)
+        let data = try Data(contentsOf: configuration.storageURL)
+        let document = try decoder.decode(ConnectionDocument.self, from: data)
         return document.connections
     }
 
     public func saveConnections(_ connections: [ConnectionProfile]) async throws {
         let document = ConnectionDocument(connections: connections)
         let data = try encoder.encode(document)
-        let key = try obtainEncryptionKey()
-        let sealedBox = try AES.GCM.seal(data, using: key)
         try ensureDirectoryExists()
-        try sealedBox.combined?.write(to: configuration.storageURL, options: .atomic)
+        try data.write(to: configuration.storageURL, options: .atomic)
     }
 
     public func upsert(_ profile: ConnectionProfile) async throws -> [ConnectionProfile] {
@@ -81,13 +67,7 @@ public final class FileConnectionStore: ConnectionStore, @unchecked Sendable {
         var connections = try await loadConnections()
         connections.removeAll { $0.id == profile.id }
         try await saveConnections(connections)
-        try cleanupKeychain(for: profile)
         return connections
-    }
-
-    private func cleanupKeychain(for profile: ConnectionProfile) throws {
-        guard case let .keychain(id) = profile.credential.storage else { return }
-        try keychain.deletePassword(account: id, service: configuration.keychainServiceName)
     }
 
     private func ensureDirectoryExists() throws {
@@ -96,26 +76,10 @@ public final class FileConnectionStore: ConnectionStore, @unchecked Sendable {
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         }
     }
-
-    private func obtainEncryptionKey() throws -> SymmetricKey {
-        let keyId = "encryption-key"
-        if let existing = try keychain.password(account: keyId, service: configuration.keychainServiceName) {
-            guard let data = Data(base64Encoded: existing) else {
-                throw ConnectionStoreError.invalidKeyMaterial
-            }
-            return SymmetricKey(data: data)
-        }
-
-        let key = SymmetricKey(size: .bits256)
-        let base64 = Data(key.withUnsafeBytes { Data($0) }).base64EncodedString()
-        try keychain.storePassword(base64, account: keyId, service: configuration.keychainServiceName)
-        return key
-    }
 }
 
 public enum ConnectionStoreError: Error, Sendable {
     case invalidPayload
-    case invalidKeyMaterial
 }
 
 public actor InMemoryConnectionStore: ConnectionStore {

@@ -17,6 +17,13 @@ final class ConnectionEditorViewModel: ObservableObject, Identifiable {
         }
     }
 
+    enum TestConnectionState {
+        case idle
+        case testing
+        case success
+        case failure(String)
+    }
+
     let id = UUID()
     let mode: Mode
 
@@ -28,16 +35,17 @@ final class ConnectionEditorViewModel: ObservableObject, Identifiable {
     @Published var username: String
     @Published var password: String
     @Published var useTLS: Bool
+    @Published var testConnectionState: TestConnectionState = .idle
 
     private let profileID: UUID?
-    let existingKeychainID: String?
+    private let driverRegistry: DatabaseDriverRegistry?
 
-    init(mode: Mode) {
+    init(mode: Mode, driverRegistry: DatabaseDriverRegistry? = nil) {
         self.mode = mode
+        self.driverRegistry = driverRegistry
         switch mode {
         case .create:
             self.profileID = nil
-            self.existingKeychainID = nil
             self.name = ""
             self.engine = .postgres
             self.host = "localhost"
@@ -48,11 +56,6 @@ final class ConnectionEditorViewModel: ObservableObject, Identifiable {
             self.useTLS = true
         case .edit(let profile, let password):
             self.profileID = profile.id
-            if case let .keychain(id) = profile.credential.storage {
-                self.existingKeychainID = id
-            } else {
-                self.existingKeychainID = nil
-            }
             self.name = profile.name
             self.engine = profile.engine
             self.host = profile.host
@@ -85,18 +88,60 @@ final class ConnectionEditorViewModel: ObservableObject, Identifiable {
         }
     }
 
-    var shouldPersistPassword: Bool {
-        requiresPassword && !password.isEmpty
+    var canTestConnection: Bool {
+        isValid && driverRegistry != nil
     }
 
-    func makeProfile(keychainID: String?) -> ConnectionProfile {
-        let portValue = Int(port) ?? Self.defaultPort(for: engine)
-        let credential: CredentialReference
-        if let keychainID, shouldPersistPassword {
-            credential = CredentialReference(storage: .keychain(id: keychainID))
-        } else {
-            credential = CredentialReference(storage: .inline(""))
+    var testConnectionStateText: String {
+        switch testConnectionState {
+        case .idle:
+            return ""
+        case .testing:
+            return "接続中..."
+        case .success:
+            return "接続成功"
+        case .failure(let error):
+            return "接続失敗: \(error)"
         }
+    }
+
+    func testConnection() async {
+        guard let driverRegistry = driverRegistry,
+              let driver = driverRegistry.driver(for: engine) else {
+            testConnectionState = .failure("対応していないデータベース種別です")
+            return
+        }
+
+        testConnectionState = .testing
+
+        do {
+            let profile = makeProfile()
+            try await driver.testConnection(using: profile)
+            testConnectionState = .success
+
+            // Reset to idle after 3 seconds
+            Task {
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+                if case .success = testConnectionState {
+                    testConnectionState = .idle
+                }
+            }
+        } catch {
+            testConnectionState = .failure(error.localizedDescription)
+
+            // Reset to idle after 5 seconds
+            Task {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                if case .failure = testConnectionState {
+                    testConnectionState = .idle
+                }
+            }
+        }
+    }
+
+    func makeProfile() -> ConnectionProfile {
+        let portValue = Int(port) ?? Self.defaultPort(for: engine)
+        let credential = CredentialReference(storage: .inline(password))
 
         return ConnectionProfile(
             id: profileID ?? UUID(),

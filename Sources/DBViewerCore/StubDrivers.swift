@@ -19,9 +19,11 @@ public struct InMemoryDataset: Sendable {
 public final class InMemoryDriver: DatabaseDriver {
     public let engine: DatabaseEngine
     private let store: InMemoryStore
+    private let dataset: InMemoryDataset
 
     public init(engine: DatabaseEngine, dataset: InMemoryDataset = .init()) {
         self.engine = engine
+        self.dataset = dataset
         self.store = InMemoryStore(dataset: dataset)
     }
 
@@ -30,6 +32,10 @@ public final class InMemoryDriver: DatabaseDriver {
     }
 
     public func testConnection(using profile: ConnectionProfile) async throws {}
+    
+    internal func makeSession(with profile: ConnectionProfile) -> DatabaseSession {
+        InMemorySession(profile: profile, store: InMemoryStore(dataset: dataset))
+    }
 }
 
 actor InMemoryStore {
@@ -208,4 +214,111 @@ actor InMemorySession: DatabaseSession {
     }
 
     func close() async {}
+}
+
+public enum StubDrivers {
+    public static let postgres = InMemoryDriver(
+        engine: .postgres,
+        dataset: InMemoryDataset(
+            schemas: [
+                DatabaseSchema(
+                    name: "public",
+                    tables: [
+                        DatabaseTable(schema: "public", name: "users", kind: .table, estimatedRowCount: 100),
+                        DatabaseTable(schema: "public", name: "posts", kind: .table, estimatedRowCount: 250),
+                        DatabaseTable(schema: "public", name: "comments", kind: .table, estimatedRowCount: 500)
+                    ]
+                ),
+                DatabaseSchema(
+                    name: "analytics",
+                    tables: [
+                        DatabaseTable(schema: "analytics", name: "events", kind: .table, estimatedRowCount: 10000),
+                        DatabaseTable(schema: "analytics", name: "user_sessions", kind: .view, estimatedRowCount: 5000)
+                    ]
+                )
+            ],
+            columns: [
+                "public.users": [
+                    DatabaseColumn(table: "public.users", name: "id", dataType: "INTEGER", isNullable: false, constraints: [.primaryKey]),
+                    DatabaseColumn(table: "public.users", name: "name", dataType: "VARCHAR(255)", isNullable: false),
+                    DatabaseColumn(table: "public.users", name: "email", dataType: "VARCHAR(255)", isNullable: false, constraints: [.unique]),
+                    DatabaseColumn(table: "public.users", name: "created_at", dataType: "TIMESTAMP", isNullable: false)
+                ],
+                "public.posts": [
+                    DatabaseColumn(table: "public.posts", name: "id", dataType: "INTEGER", isNullable: false, constraints: [.primaryKey]),
+                    DatabaseColumn(table: "public.posts", name: "user_id", dataType: "INTEGER", isNullable: false, constraints: [.foreignKey(reference: "public.users(id)")]),
+                    DatabaseColumn(table: "public.posts", name: "title", dataType: "VARCHAR(255)", isNullable: false),
+                    DatabaseColumn(table: "public.posts", name: "content", dataType: "TEXT", isNullable: true),
+                    DatabaseColumn(table: "public.posts", name: "created_at", dataType: "TIMESTAMP", isNullable: false)
+                ],
+                "public.comments": [
+                    DatabaseColumn(table: "public.comments", name: "id", dataType: "INTEGER", isNullable: false, constraints: [.primaryKey]),
+                    DatabaseColumn(table: "public.comments", name: "post_id", dataType: "INTEGER", isNullable: false, constraints: [.foreignKey(reference: "public.posts(id)")]),
+                    DatabaseColumn(table: "public.comments", name: "author", dataType: "VARCHAR(255)", isNullable: false),
+                    DatabaseColumn(table: "public.comments", name: "content", dataType: "TEXT", isNullable: false),
+                    DatabaseColumn(table: "public.comments", name: "created_at", dataType: "TIMESTAMP", isNullable: false)
+                ],
+                "analytics.events": [
+                    DatabaseColumn(table: "analytics.events", name: "id", dataType: "BIGINT", isNullable: false, constraints: [.primaryKey]),
+                    DatabaseColumn(table: "analytics.events", name: "event_type", dataType: "VARCHAR(100)", isNullable: false),
+                    DatabaseColumn(table: "analytics.events", name: "user_id", dataType: "INTEGER", isNullable: true, constraints: [.foreignKey(reference: "public.users(id)")]),
+                    DatabaseColumn(table: "analytics.events", name: "data", dataType: "JSONB", isNullable: true),
+                    DatabaseColumn(table: "analytics.events", name: "created_at", dataType: "TIMESTAMP", isNullable: false)
+                ],
+                "analytics.user_sessions": [
+                    DatabaseColumn(table: "analytics.user_sessions", name: "user_id", dataType: "INTEGER", isNullable: false),
+                    DatabaseColumn(table: "analytics.user_sessions", name: "session_count", dataType: "BIGINT", isNullable: false),
+                    DatabaseColumn(table: "analytics.user_sessions", name: "last_session", dataType: "TIMESTAMP", isNullable: true)
+                ]
+            ],
+            rows: [
+                "public.users": [
+                    DataRow(cells: [
+                        "id": .int(1),
+                        "name": .string("John Doe"),
+                        "email": .string("john@example.com"),
+                        "created_at": .timestamp(Date())
+                    ]),
+                    DataRow(cells: [
+                        "id": .int(2),
+                        "name": .string("Jane Smith"),
+                        "email": .string("jane@example.com"),
+                        "created_at": .timestamp(Date())
+                    ])
+                ],
+                "public.posts": [
+                    DataRow(cells: [
+                        "id": .int(1),
+                        "user_id": .int(1),
+                        "title": .string("First Post"),
+                        "content": .string("This is my first post!"),
+                        "created_at": .timestamp(Date())
+                    ])
+                ],
+                "public.comments": [
+                    DataRow(cells: [
+                        "id": .int(1),
+                        "post_id": .int(1),
+                        "author": .string("Anonymous"),
+                        "content": .string("Great post!"),
+                        "created_at": .timestamp(Date())
+                    ])
+                ]
+            ]
+        )
+    )
+    
+    public var session: DatabaseSession {
+        let profile = ConnectionProfile(
+            name: "Test Connection",
+            engine: .postgres,
+            host: "localhost",
+            port: 5432,
+            database: "test_db",
+            username: "testuser",
+            credential: CredentialReference(storage: .inline("password"))
+        )
+        
+        return StubDrivers.postgres.makeSession(with: profile)
+    }
 }
