@@ -10,6 +10,7 @@ final class ConnectionListViewModel: ObservableObject {
     enum DetailMode: String, CaseIterable, Identifiable {
         case table
         case sql
+        case backup
 
         var id: String { rawValue }
 
@@ -19,14 +20,14 @@ final class ConnectionListViewModel: ObservableObject {
                 return "テーブル"
             case .sql:
                 return "SQLコンソール"
+            case .backup:
+                return "バックアップ"
             }
         }
     }
 
     struct Dependencies {
         var connectionStore: any ConnectionStore
-        var keychain: any KeychainService
-        var keychainServiceName: String
 
         static var preview: Dependencies {
             let sampleProfile = ConnectionProfile(
@@ -36,10 +37,10 @@ final class ConnectionListViewModel: ObservableObject {
                 port: 5432,
                 database: "postgres",
                 username: "postgres",
-                credential: .init(storage: .keychain(id: "sample"))
+                credential: .init(storage: .inline("postgres"))
             )
             let store = InMemoryConnectionStore(items: [sampleProfile])
-            return Dependencies(connectionStore: store, keychain: InMemoryKeychainService(), keychainServiceName: "preview")
+            return Dependencies(connectionStore: store)
         }
     }
 
@@ -79,6 +80,8 @@ final class ConnectionListViewModel: ObservableObject {
             formatValue: TableRowViewModel.format
         )
     }()
+    
+    private(set) lazy var backupViewModel: DatabaseBackupViewModel? = nil
 
     init(dependencies: Dependencies, driverRegistry: DatabaseDriverRegistry) {
         self.dependencies = dependencies
@@ -100,13 +103,13 @@ final class ConnectionListViewModel: ObservableObject {
     }
 
     func startCreatingConnection() {
-        editorViewModel = ConnectionEditorViewModel(mode: .create)
+        editorViewModel = ConnectionEditorViewModel(mode: .create, driverRegistry: driverRegistry)
     }
 
     func startEditingSelectedConnection() {
         guard let selectedConnection else { return }
-        let password = (try? existingPassword(for: selectedConnection)) ?? ""
-        editorViewModel = ConnectionEditorViewModel(mode: .edit(selectedConnection, password: password))
+        let password = existingPassword(for: selectedConnection)
+        editorViewModel = ConnectionEditorViewModel(mode: .edit(selectedConnection, password: password), driverRegistry: driverRegistry)
     }
 
     func saveEditor() {
@@ -115,8 +118,7 @@ final class ConnectionListViewModel: ObservableObject {
 
         Task {
             do {
-                let keychainID = try await persistPassword(from: editorViewModel)
-                let profile = editorViewModel.makeProfile(keychainID: keychainID)
+                let profile = editorViewModel.makeProfile()
                 let updatedConnections = try await dependencies.connectionStore.upsert(profile)
                 await MainActor.run {
                     self.connections = updatedConnections
@@ -189,33 +191,12 @@ final class ConnectionListViewModel: ObservableObject {
         }
     }
 
-    private func persistPassword(from editorViewModel: ConnectionEditorViewModel) async throws -> String? {
-        guard editorViewModel.shouldPersistPassword else {
-            if let existingID = editorViewModel.existingKeychainID {
-                try dependencies.keychain.deletePassword(account: existingID, service: dependencies.keychainServiceName)
-            }
-            return nil
-        }
-        let password = editorViewModel.password
-        var keychainID = editorViewModel.existingKeychainID
-        if keychainID == nil {
-            keychainID = "connection-" + UUID().uuidString
-        }
-
-        guard let resolvedID = keychainID else {
-            throw KeychainError.conversionFailure
-        }
-
-        try dependencies.keychain.storePassword(password, account: resolvedID, service: dependencies.keychainServiceName)
-        return resolvedID
-    }
-
-    private func existingPassword(for profile: ConnectionProfile) throws -> String? {
+    private func existingPassword(for profile: ConnectionProfile) -> String {
         switch profile.credential.storage {
         case .inline(let value):
             return value
-        case .keychain(let id):
-            return try dependencies.keychain.password(account: id, service: dependencies.keychainServiceName)
+        case .keychain:
+            return ""
         }
     }
 
@@ -227,16 +208,29 @@ final class ConnectionListViewModel: ObservableObject {
 
         do {
             let session = try await driver.openSession(using: connection)
-            let newSchemas = try await session.listSchemas()
+            let schemaList = try await session.listSchemas()
+
+            // 各スキーマのテーブル一覧を取得
+            var schemasWithTables: [DatabaseSchema] = []
+            for schema in schemaList {
+                let tables = try await session.listTables(in: schema.name)
+                schemasWithTables.append(DatabaseSchema(name: schema.name, tables: tables))
+            }
+
             await session.close()
-            schemas = newSchemas
+
+            // Initialize backup view model with driver and connection info
+            backupViewModel = DatabaseBackupViewModel(connection: connection, driver: driver)
+
+            schemas = schemasWithTables
             errorMessage = nil
             skipNextSelectionRefresh = true
-            reconcileSelection(with: newSchemas)
+            reconcileSelection(with: schemasWithTables)
             await loadSelectedTable(reset: true)
             skipNextSelectionRefresh = false
         } catch {
             errorMessage = error.localizedDescription
+            backupViewModel = nil
         }
     }
 
@@ -432,8 +426,21 @@ final class ConnectionListViewModel: ObservableObject {
 
         Task { [weak self] in
             guard let self else { return }
-            guard let destination = await self.requestBackupDestination() else { return }
+            guard let destination = await self.requestBackupDestination(for: table) else { return }
             await self.performBackup(for: table, to: destination)
+        }
+    }
+
+    func exportAllTablesBackup() {
+        let tables = schemas
+            .flatMap { $0.tables }
+            .filter { $0.kind == .table }
+        guard !tables.isEmpty else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            guard let directory = await self.requestBackupDirectory() else { return }
+            await self.performBackup(for: tables, to: directory)
         }
     }
 
@@ -452,17 +459,38 @@ final class ConnectionListViewModel: ObservableObject {
     }
 
     private func performBackup(for table: DatabaseTable, to destination: URL) async {
+        await runBackupTask {
+            try await self.writeBackup(for: table, to: destination)
+        }
+    }
+
+    private func performBackup(for tables: [DatabaseTable], to directory: URL) async {
+        await runBackupTask {
+            let timestamp = backupDateFormatter.string(from: Date())
+            for table in tables {
+                let fileName = self.backupFileName(for: table, timestamp: timestamp)
+                let destination = directory.appendingPathComponent(fileName)
+                try await self.writeBackup(for: table, to: destination)
+            }
+        }
+    }
+
+    private func runBackupTask(_ work: () async throws -> Void) async {
         isExportingBackup = true
         defer { isExportingBackup = false }
 
         do {
-            let snapshot = try await fetchTableSnapshot(for: table)
-            let sql = makeBackupSQL(for: table, snapshot: snapshot)
-            try sql.write(to: destination, atomically: true, encoding: .utf8)
+            try await work()
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func writeBackup(for table: DatabaseTable, to destination: URL) async throws {
+        let snapshot = try await fetchTableSnapshot(for: table)
+        let sql = makeBackupSQL(for: table, snapshot: snapshot)
+        try sql.write(to: destination, atomically: true, encoding: .utf8)
     }
 
     private func fetchTableSnapshot(for table: DatabaseTable) async throws -> (columns: [DatabaseColumn], rows: [DataRow]) {
@@ -549,14 +577,14 @@ final class ConnectionListViewModel: ObservableObject {
             .replacingOccurrences(of: "'", with: "''")
     }
 
-    private func requestBackupDestination() async -> URL? {
+    private func requestBackupDestination(for table: DatabaseTable) async -> URL? {
 #if canImport(AppKit)
         let panel = NSSavePanel()
         if let sqlType = UTType(filenameExtension: "sql") {
             panel.allowedContentTypes = [sqlType]
         }
         panel.canCreateDirectories = true
-        panel.nameFieldStringValue = backupFileName()
+        panel.nameFieldStringValue = backupFileName(for: table)
         let response = panel.runModal()
         return response == .OK ? panel.url : nil
 #else
@@ -564,8 +592,34 @@ final class ConnectionListViewModel: ObservableObject {
 #endif
     }
 
-    private func backupFileName() -> String {
-        "\(backupDateFormatter.string(from: Date())).sql"
+    private func requestBackupDirectory() async -> URL? {
+#if canImport(AppKit)
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        let response = panel.runModal()
+        return response == .OK ? panel.url : nil
+#else
+        return nil
+#endif
+    }
+
+    private func backupFileName(for table: DatabaseTable, timestamp: String? = nil) -> String {
+        let resolvedTimestamp = timestamp ?? backupDateFormatter.string(from: Date())
+        let schemaComponent = sanitizedFileComponent(table.schema)
+        let tableComponent = sanitizedFileComponent(table.name)
+        let identifier = schemaComponent.isEmpty ? tableComponent : "\(schemaComponent).\(tableComponent)"
+        return "\(resolvedTimestamp)-\(identifier).sql"
+    }
+
+    private func sanitizedFileComponent(_ value: String) -> String {
+        let invalidCharacters = CharacterSet(charactersIn: "/\\?%*|\"<>:")
+        let sanitizedScalars = value.unicodeScalars.map { scalar -> String in
+            invalidCharacters.contains(scalar) ? "_" : String(scalar)
+        }
+        let sanitized = sanitizedScalars.joined().replacingOccurrences(of: " ", with: "_")
+        return sanitized.isEmpty ? "unnamed" : sanitized
     }
 
     struct TableRowViewModel: Identifiable {
