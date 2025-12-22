@@ -28,7 +28,20 @@ final class ConnectionEditorViewModel: ObservableObject, Identifiable {
     let mode: Mode
 
     @Published var name: String
-    @Published var engine: DatabaseEngine
+    @Published var engine: DatabaseEngine {
+        didSet {
+            if engine != oldValue {
+                // エンジン変更時にデフォルトポートを設定
+                port = String(Self.defaultPort(for: engine))
+                // SQLiteの場合はデータベース名をファイルパス用にクリア
+                if engine == .sqlite {
+                    host = ""
+                    username = ""
+                    database = ""
+                }
+            }
+        }
+    }
     @Published var host: String
     @Published var port: String
     @Published var database: String
@@ -76,7 +89,18 @@ final class ConnectionEditorViewModel: ObservableObject, Identifiable {
     }
 
     var isValid: Bool {
-        !name.isEmpty && !host.isEmpty && !database.isEmpty && !username.isEmpty && Int(port) != nil
+        if name.isEmpty {
+            return false
+        }
+
+        switch engine {
+        case .sqlite:
+            // SQLiteはファイルパス（database）のみ必須
+            return !database.isEmpty
+        case .postgres, .mysql:
+            // PostgreSQL/MySQLはhost, database, username, portが必須
+            return !host.isEmpty && !database.isEmpty && !username.isEmpty && Int(port) != nil
+        }
     }
 
     var requiresPassword: Bool {

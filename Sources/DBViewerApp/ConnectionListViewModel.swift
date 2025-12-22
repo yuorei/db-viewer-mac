@@ -564,6 +564,9 @@ final class ConnectionListViewModel: ObservableObject {
             return "X'\(hex)'"
         case .json(let json):
             return "'\(escapeStringLiteral(json))'"
+        case .array(let values):
+            let formattedValues = values.map { sqlLiteral(for: $0) }.joined(separator: ", ")
+            return "(\(formattedValues))"
         }
     }
 
@@ -665,6 +668,8 @@ final class ConnectionListViewModel: ObservableObject {
                 return "BLOB(\(data.count))"
             case .json(let json):
                 return json
+            case .array(let values):
+                return values.map { format($0) }.joined(separator: ", ")
             }
         }
     }

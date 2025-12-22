@@ -1,6 +1,7 @@
 import Foundation
 import SQLite3
 import PostgresNIO
+import MySQLNIO
 import NIOCore
 import NIOPosix
 import Logging
@@ -87,12 +88,19 @@ public final class PostgreSQLDriver: DatabaseDriver, @unchecked Sendable {
     }
 }
 
-// MySQL Driver - For now, a placeholder that attempts real connections
-public final class MySQLDriver: DatabaseDriver {
+// MySQL Driver - Real implementation using MySQLNIO
+public final class MySQLDriver: DatabaseDriver, @unchecked Sendable {
     public let engine: DatabaseEngine = .mysql
-    
-    public init() {}
-    
+    private let eventLoopGroup: MultiThreadedEventLoopGroup
+
+    public init() {
+        self.eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    }
+
+    deinit {
+        try? eventLoopGroup.syncShutdownGracefully()
+    }
+
     public func testConnection(using profile: ConnectionProfile) async throws {
         guard !profile.host.isEmpty,
               profile.port > 0,
@@ -100,21 +108,55 @@ public final class MySQLDriver: DatabaseDriver {
               !profile.username.isEmpty else {
             throw DatabaseDriverError.connectionFailed(reason: "必須フィールドが入力されていません")
         }
-        
-        // For now, simulate connection test
-        // In a real implementation, we would try to connect to MySQL
-        try await Task.sleep(nanoseconds: 500_000_000) // 0.5 second delay
-        
-        // Simulate connection success for valid hostnames
-        let validHosts = ["localhost", "127.0.0.1", "mysql", "db", "database"]
-        if !validHosts.contains(profile.host) && !profile.host.hasPrefix("192.168.") && !profile.host.hasPrefix("10.") {
-            throw DatabaseDriverError.connectionFailed(reason: "MySQL接続に失敗しました: ホスト \(profile.host) に接続できませんでした")
+
+        let password = getPassword(from: profile.credential)
+
+        var logger = Logger(label: "db-viewer.mysql")
+        logger.logLevel = .error
+
+        do {
+            let connection = try await MySQLConnection.connect(
+                to: .makeAddressResolvingHost(profile.host, port: profile.port),
+                username: profile.username,
+                database: profile.database,
+                password: password ?? "",
+                tlsConfiguration: nil,
+                logger: logger,
+                on: eventLoopGroup.next()
+            ).get()
+            _ = try await connection.close().get()
+        } catch {
+            throw DatabaseDriverError.connectionFailed(reason: "MySQL接続に失敗しました: \(error.localizedDescription)")
         }
     }
-    
+
     public func openSession(using profile: ConnectionProfile) async throws -> DatabaseSession {
-        try await testConnection(using: profile)
-        return MySQLSession(profile: profile)
+        let password = getPassword(from: profile.credential)
+
+        var logger = Logger(label: "db-viewer.mysql")
+        logger.logLevel = .error
+
+        let connection = try await MySQLConnection.connect(
+            to: .makeAddressResolvingHost(profile.host, port: profile.port),
+            username: profile.username,
+            database: profile.database,
+            password: password ?? "",
+            tlsConfiguration: nil,
+            logger: logger,
+            on: eventLoopGroup.next()
+        ).get()
+
+        return MySQLSession(profile: profile, connection: connection, logger: logger)
+    }
+
+    private func getPassword(from credential: CredentialReference) -> String? {
+        switch credential.storage {
+        case .inline(let password):
+            return password
+        case .keychain:
+            // TODO: Implement keychain retrieval
+            return nil
+        }
     }
 }
 
@@ -190,10 +232,11 @@ actor PostgreSQLSession: DatabaseSession {
     }
 
     func listTables(in schema: String) async throws -> [DatabaseTable] {
+        let escapedSchema = escapeStringLiteral(schema)
         let sql = """
             SELECT table_name, table_type
             FROM information_schema.tables
-            WHERE table_schema = '\(schema)'
+            WHERE table_schema = '\(escapedSchema)'
             ORDER BY table_name
             """
 
@@ -211,6 +254,8 @@ actor PostgreSQLSession: DatabaseSession {
     }
 
     func describe(table: DatabaseTable) async throws -> [DatabaseColumn] {
+        let escapedSchema = escapeStringLiteral(table.schema)
+        let escapedTable = escapeStringLiteral(table.name)
         let sql = """
             SELECT
                 c.column_name,
@@ -224,12 +269,12 @@ actor PostgreSQLSession: DatabaseSession {
                 FROM information_schema.table_constraints tc
                 JOIN information_schema.key_column_usage ku
                     ON tc.constraint_name = ku.constraint_name
-                WHERE tc.table_schema = '\(table.schema)'
-                    AND tc.table_name = '\(table.name)'
+                WHERE tc.table_schema = '\(escapedSchema)'
+                    AND tc.table_name = '\(escapedTable)'
                     AND tc.constraint_type = 'PRIMARY KEY'
             ) pk ON c.column_name = pk.column_name
-            WHERE c.table_schema = '\(table.schema)'
-                AND c.table_name = '\(table.name)'
+            WHERE c.table_schema = '\(escapedSchema)'
+                AND c.table_name = '\(escapedTable)'
             ORDER BY c.ordinal_position
             """
 
@@ -262,7 +307,7 @@ actor PostgreSQLSession: DatabaseSession {
     }
 
     func execute(query: DataQueryRequest) async throws -> DataPage {
-        var sql = "SELECT * FROM \"\(query.table.schema)\".\"\(query.table.name)\""
+        var sql = "SELECT * FROM \(escapeIdentifier(query.table.schema)).\(escapeIdentifier(query.table.name))"
 
         // Add WHERE clause for filters
         if !query.filters.isEmpty {
@@ -278,7 +323,7 @@ actor PostgreSQLSession: DatabaseSession {
                 case .ilike: "ILIKE"
                 case .inSet: "IN"
                 }
-                return "\"\(filter.column)\" \(op) \(formatValue(filter.value))"
+                return "\(escapeIdentifier(filter.column)) \(op) \(formatValue(filter.value))"
             }
             sql += " WHERE " + filterClauses.joined(separator: " AND ")
         }
@@ -286,7 +331,7 @@ actor PostgreSQLSession: DatabaseSession {
         // Add ORDER BY clause
         if !query.sorts.isEmpty {
             let sortClauses = query.sorts.map { sort in
-                "\"\(sort.column)\" \(sort.ascending ? "ASC" : "DESC")"
+                "\(escapeIdentifier(sort.column)) \(sort.ascending ? "ASC" : "DESC")"
             }
             sql += " ORDER BY " + sortClauses.joined(separator: ", ")
         }
@@ -318,25 +363,36 @@ actor PostgreSQLSession: DatabaseSession {
 
     func execute(modification: ModificationRequest) async throws -> ModificationResult {
         var sql: String
+        let escapedSchema = escapeIdentifier(modification.table.schema)
+        let escapedTable = escapeIdentifier(modification.table.name)
 
         switch modification.operation {
         case .insert(let values):
-            let columnNames = values.keys.map { "\"\($0)\"" }.joined(separator: ", ")
+            let columnNames = values.keys.map { escapeIdentifier($0) }.joined(separator: ", ")
             let valueStrings = values.values.map { formatValue($0) }.joined(separator: ", ")
-            sql = "INSERT INTO \"\(modification.table.schema)\".\"\(modification.table.name)\" (\(columnNames)) VALUES (\(valueStrings))"
+            sql = "INSERT INTO \(escapedSchema).\(escapedTable) (\(columnNames)) VALUES (\(valueStrings))"
 
         case .update(let values, let lock):
-            let setClauses = values.map { "\"\($0.key)\" = \(formatValue($0.value))" }.joined(separator: ", ")
-            sql = "UPDATE \"\(modification.table.schema)\".\"\(modification.table.name)\" SET \(setClauses)"
+            let setClauses = values.map { "\(escapeIdentifier($0.key)) = \(formatValue($0.value))" }.joined(separator: ", ")
+            sql = "UPDATE \(escapedSchema).\(escapedTable) SET \(setClauses)"
             sql += " WHERE " + buildWhereClause(from: lock)
 
         case .delete(let lock):
-            sql = "DELETE FROM \"\(modification.table.schema)\".\"\(modification.table.name)\""
+            sql = "DELETE FROM \(escapedSchema).\(escapedTable)"
             sql += " WHERE " + buildWhereClause(from: lock)
         }
 
-        _ = try await connection.query(PostgresQuery(unsafeSQL: sql), logger: logger)
-        return ModificationResult(affectedRows: 1)
+        // クエリを実行し、全行を消費してメタデータを取得
+        let rows = try await connection.query(PostgresQuery(unsafeSQL: sql), logger: logger)
+        var rowCount = 0
+        for try await _ in rows {
+            rowCount += 1
+        }
+
+        // INSERT/UPDATE/DELETEの場合、影響行数を取得（RETURNINGがない場合は0行が返る）
+        // 影響行数が不明な場合は1を返す（楽観ロック前提で1行のみ変更）
+        let affectedRows = rowCount > 0 ? rowCount : 1
+        return ModificationResult(affectedRows: affectedRows)
     }
 
     func execute(sql: String, limit: Int?) async throws -> SQLQueryResult {
@@ -378,6 +434,19 @@ actor PostgreSQLSession: DatabaseSession {
     }
 
     // Helper methods
+
+    /// PostgreSQLの識別子（テーブル名、カラム名、スキーマ名）をエスケープする
+    /// ダブルクォートで囲み、内部のダブルクォートは2つにエスケープする
+    private func escapeIdentifier(_ identifier: String) -> String {
+        let escaped = identifier.replacingOccurrences(of: "\"", with: "\"\"")
+        return "\"\(escaped)\""
+    }
+
+    /// PostgreSQLの文字列リテラルをエスケープする
+    private func escapeStringLiteral(_ value: String) -> String {
+        return value.replacingOccurrences(of: "'", with: "''")
+    }
+
     private func formatValue(_ value: DatabaseValue) -> String {
         switch value {
         case .null:
@@ -403,15 +472,19 @@ actor PostgreSQLSession: DatabaseSession {
             return "E'\\\\x\(data.map { String(format: "%02x", $0) }.joined())'"
         case .json(let json):
             return "'\(json.replacingOccurrences(of: "'", with: "''"))'::jsonb"
+        case .array(let values):
+            // IN句用: (value1, value2, ...)
+            let formattedValues = values.map { formatValue($0) }.joined(separator: ", ")
+            return "(\(formattedValues))"
         }
     }
 
     private func buildWhereClause(from lock: ModificationRequest.OptimisticLock) -> String {
         switch lock.strategy {
         case .primaryKey(let keys):
-            return keys.map { "\"\($0.key)\" = \(formatValue($0.value))" }.joined(separator: " AND ")
+            return keys.map { "\(escapeIdentifier($0.key)) = \(formatValue($0.value))" }.joined(separator: " AND ")
         case .allColumns(let snapshot):
-            return snapshot.map { "\"\($0.key)\" = \(formatValue($0.value))" }.joined(separator: " AND ")
+            return snapshot.map { "\(escapeIdentifier($0.key)) = \(formatValue($0.value))" }.joined(separator: " AND ")
         }
     }
 
@@ -444,124 +517,341 @@ actor PostgreSQLSession: DatabaseSession {
     }
 }
 
-// MySQL Session - simplified implementation for now
+// MySQL Session - Real implementation using MySQLNIO
 actor MySQLSession: DatabaseSession {
     let profile: ConnectionProfile
-    
-    init(profile: ConnectionProfile) {
+    private let connection: MySQLConnection
+    private var logger: Logger
+
+    init(profile: ConnectionProfile, connection: MySQLConnection, logger: Logger) {
         self.profile = profile
+        self.connection = connection
+        self.logger = logger
     }
-    
+
     func listSchemas() async throws -> [DatabaseSchema] {
-        // For now, return the configured database as a schema
-        return [DatabaseSchema(name: profile.database)]
+        let sql = "SHOW DATABASES"
+        var schemas: [DatabaseSchema] = []
+
+        let rows = try await connection.query(sql, []).get()
+        for row in rows {
+            if let name = row.column("Database")?.string {
+                // システムデータベースを除外
+                if !["information_schema", "mysql", "performance_schema", "sys"].contains(name) {
+                    schemas.append(DatabaseSchema(name: name))
+                }
+            }
+        }
+        return schemas
     }
-    
+
     func listTables(in schema: String) async throws -> [DatabaseTable] {
-        // For now, return sample tables
-        return [
-            DatabaseTable(schema: schema, name: "users", kind: .table),
-            DatabaseTable(schema: schema, name: "orders", kind: .table),
-            DatabaseTable(schema: schema, name: "products", kind: .table),
-            DatabaseTable(schema: schema, name: "active_users", kind: .view)
-        ]
+        let sql = """
+            SELECT TABLE_NAME, TABLE_TYPE
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = ?
+            ORDER BY TABLE_NAME
+            """
+
+        var tables: [DatabaseTable] = []
+        let rows = try await connection.query(sql, [MySQLData(string: schema)]).get()
+
+        for row in rows {
+            if let name = row.column("TABLE_NAME")?.string,
+               let tableType = row.column("TABLE_TYPE")?.string {
+                let kind: DatabaseTable.TableKind = tableType == "VIEW" ? .view : .table
+                tables.append(DatabaseTable(schema: schema, name: name, kind: kind))
+            }
+        }
+        return tables
     }
-    
+
     func describe(table: DatabaseTable) async throws -> [DatabaseColumn] {
-        // Return sample column structure
-        switch table.name {
-        case "users":
-            return [
-                DatabaseColumn(table: table.name, name: "id", dataType: "int", isNullable: false, constraints: [.primaryKey]),
-                DatabaseColumn(table: table.name, name: "username", dataType: "varchar(50)", isNullable: false),
-                DatabaseColumn(table: table.name, name: "email", dataType: "varchar(100)", isNullable: true),
-                DatabaseColumn(table: table.name, name: "created_at", dataType: "datetime", isNullable: false, defaultValue: "CURRENT_TIMESTAMP")
-            ]
-        case "orders":
-            return [
-                DatabaseColumn(table: table.name, name: "id", dataType: "int", isNullable: false, constraints: [.primaryKey]),
-                DatabaseColumn(table: table.name, name: "user_id", dataType: "int", isNullable: false),
-                DatabaseColumn(table: table.name, name: "total", dataType: "decimal(10,2)", isNullable: false),
-                DatabaseColumn(table: table.name, name: "status", dataType: "varchar(20)", isNullable: false, defaultValue: "'pending'"),
-                DatabaseColumn(table: table.name, name: "created_at", dataType: "datetime", isNullable: false, defaultValue: "CURRENT_TIMESTAMP")
-            ]
-        case "products":
-            return [
-                DatabaseColumn(table: table.name, name: "id", dataType: "int", isNullable: false, constraints: [.primaryKey]),
-                DatabaseColumn(table: table.name, name: "name", dataType: "varchar(100)", isNullable: false),
-                DatabaseColumn(table: table.name, name: "price", dataType: "decimal(8,2)", isNullable: false),
-                DatabaseColumn(table: table.name, name: "stock", dataType: "int", isNullable: false, defaultValue: "0")
-            ]
-        default:
-            return []
+        let sql = """
+            SELECT
+                c.COLUMN_NAME,
+                c.DATA_TYPE,
+                c.IS_NULLABLE,
+                c.COLUMN_DEFAULT,
+                c.COLUMN_KEY
+            FROM INFORMATION_SCHEMA.COLUMNS c
+            WHERE c.TABLE_SCHEMA = ?
+                AND c.TABLE_NAME = ?
+            ORDER BY c.ORDINAL_POSITION
+            """
+
+        var columns: [DatabaseColumn] = []
+        let rows = try await connection.query(sql, [
+            MySQLData(string: table.schema),
+            MySQLData(string: table.name)
+        ]).get()
+
+        for row in rows {
+            guard let name = row.column("COLUMN_NAME")?.string,
+                  let dataType = row.column("DATA_TYPE")?.string,
+                  let isNullable = row.column("IS_NULLABLE")?.string else {
+                continue
+            }
+
+            let defaultValue = row.column("COLUMN_DEFAULT")?.string
+            let columnKey = row.column("COLUMN_KEY")?.string ?? ""
+
+            var constraints: Set<DatabaseColumn.ColumnConstraint> = []
+            if columnKey == "PRI" {
+                constraints.insert(.primaryKey)
+            }
+
+            columns.append(DatabaseColumn(
+                table: table.name,
+                name: name,
+                dataType: dataType,
+                isNullable: isNullable == "YES",
+                defaultValue: defaultValue,
+                constraints: constraints
+            ))
         }
+        return columns
     }
-    
+
     func execute(query: DataQueryRequest) async throws -> DataPage {
-        // Return sample data for demonstration
-        let sampleRows: [DataRow] = switch query.table.name {
-        case "users":
-            [
-                DataRow(cells: [
-                    "id": .int(1),
-                    "username": .string("alice"),
-                    "email": .string("alice@example.com"),
-                    "created_at": .timestamp(Date())
-                ]),
-                DataRow(cells: [
-                    "id": .int(2),
-                    "username": .string("bob"),
-                    "email": .string("bob@example.com"),
-                    "created_at": .timestamp(Date())
-                ])
-            ]
-        case "orders":
-            [
-                DataRow(cells: [
-                    "id": .int(1),
-                    "user_id": .int(1),
-                    "total": .decimal("99.99"),
-                    "status": .string("completed"),
-                    "created_at": .timestamp(Date())
-                ])
-            ]
-        case "products":
-            [
-                DataRow(cells: [
-                    "id": .int(1),
-                    "name": .string("Laptop"),
-                    "price": .decimal("1299.99"),
-                    "stock": .int(5)
-                ]),
-                DataRow(cells: [
-                    "id": .int(2),
-                    "name": .string("Mouse"),
-                    "price": .decimal("29.99"),
-                    "stock": .int(100)
-                ])
-            ]
-        default:
-            []
+        var sql = "SELECT * FROM \(escapeIdentifier(query.table.schema)).\(escapeIdentifier(query.table.name))"
+        var bindings: [MySQLData] = []
+
+        // Add WHERE clause for filters
+        if !query.filters.isEmpty {
+            var filterClauses: [String] = []
+            for filter in query.filters {
+                let escapedColumn = escapeIdentifier(filter.column)
+
+                switch filter.operation {
+                case .equals:
+                    filterClauses.append("\(escapedColumn) = ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .notEquals:
+                    filterClauses.append("\(escapedColumn) != ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .greaterThan:
+                    filterClauses.append("\(escapedColumn) > ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .lessThan:
+                    filterClauses.append("\(escapedColumn) < ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .greaterThanOrEqual:
+                    filterClauses.append("\(escapedColumn) >= ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .lessThanOrEqual:
+                    filterClauses.append("\(escapedColumn) <= ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .like:
+                    filterClauses.append("\(escapedColumn) LIKE ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .ilike:
+                    // MySQLにはILIKEがないため、LOWER()を使用して大文字小文字を区別しない検索を実現
+                    filterClauses.append("LOWER(\(escapedColumn)) LIKE LOWER(?)")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .inSet:
+                    // IN句: 配列の各値に対してプレースホルダを生成
+                    if case .array(let values) = filter.value {
+                        let placeholders = values.map { _ in "?" }.joined(separator: ", ")
+                        filterClauses.append("\(escapedColumn) IN (\(placeholders))")
+                        for value in values {
+                            bindings.append(convertToMySQLData(value))
+                        }
+                    } else {
+                        // 単一値の場合は従来通り
+                        filterClauses.append("\(escapedColumn) IN (?)")
+                        bindings.append(convertToMySQLData(filter.value))
+                    }
+                }
+            }
+            sql += " WHERE " + filterClauses.joined(separator: " AND ")
         }
-        
-        return DataPage(rows: sampleRows, hasMore: false)
+
+        // Add ORDER BY clause
+        if !query.sorts.isEmpty {
+            let sortClauses = query.sorts.map { sort in
+                "\(escapeIdentifier(sort.column)) \(sort.ascending ? "ASC" : "DESC")"
+            }
+            sql += " ORDER BY " + sortClauses.joined(separator: ", ")
+        }
+
+        // Add LIMIT and OFFSET
+        sql += " LIMIT \(query.limit) OFFSET \(query.offset)"
+
+
+        var dataRows: [DataRow] = []
+        let rows = try await connection.query(sql, bindings).get()
+
+        for row in rows {
+            // クエリ結果から直接カラム名を取得
+            let columnNames = row.columnDefinitions.map { $0.name }
+            var cells: [String: DatabaseValue] = [:]
+            for columnName in columnNames {
+                if let column = row.column(columnName) {
+                    cells[columnName] = extractValue(from: column)
+                }
+            }
+            dataRows.append(DataRow(cells: cells))
+        }
+
+        return DataPage(rows: dataRows, hasMore: dataRows.count == query.limit)
     }
-    
+
     func execute(modification: ModificationRequest) async throws -> ModificationResult {
-        // Simulate successful modification
-        return ModificationResult(affectedRows: 1)
+        var sql: String
+        var bindings: [MySQLData] = []
+        let escapedSchema = escapeIdentifier(modification.table.schema)
+        let escapedTable = escapeIdentifier(modification.table.name)
+
+        switch modification.operation {
+        case .insert(let values):
+            let columnNames = values.keys.map { escapeIdentifier($0) }.joined(separator: ", ")
+            let placeholders = values.keys.map { _ in "?" }.joined(separator: ", ")
+            sql = "INSERT INTO \(escapedSchema).\(escapedTable) (\(columnNames)) VALUES (\(placeholders))"
+            bindings = values.values.map { convertToMySQLData($0) }
+
+        case .update(let values, let lock):
+            let setClauses = values.keys.map { "\(escapeIdentifier($0)) = ?" }.joined(separator: ", ")
+            sql = "UPDATE \(escapedSchema).\(escapedTable) SET \(setClauses)"
+            bindings = values.values.map { convertToMySQLData($0) }
+
+            let whereResult = buildWhereClause(from: lock)
+            sql += " WHERE " + whereResult.clause
+            bindings.append(contentsOf: whereResult.bindings)
+
+        case .delete(let lock):
+            sql = "DELETE FROM \(escapedSchema).\(escapedTable)"
+            let whereResult = buildWhereClause(from: lock)
+            sql += " WHERE " + whereResult.clause
+            bindings = whereResult.bindings
+        }
+
+        _ = try await connection.query(sql, bindings).get()
+
+        // ROW_COUNT()で実際の影響行数を取得
+        let countRows = try await connection.query("SELECT ROW_COUNT() as cnt", []).get()
+        var affectedRows = 1
+        if let firstRow = countRows.first,
+           let count = firstRow.column("cnt")?.int {
+            affectedRows = count
+        }
+
+        return ModificationResult(affectedRows: affectedRows)
     }
-    
+
     func execute(sql: String, limit: Int?) async throws -> SQLQueryResult {
-        // Return sample SQL result
-        return SQLQueryResult(
-            columns: ["result"],
-            rows: [DataRow(cells: ["result": .string("MySQL query executed: \(sql)")])]
-        )
+        var finalSQL = sql.trimmingCharacters(in: .whitespacesAndNewlines)
+        if finalSQL.hasSuffix(";") {
+            finalSQL = String(finalSQL.dropLast())
+        }
+
+        if let limit = limit {
+            finalSQL += " LIMIT \(limit)"
+        }
+
+        var columns: [String] = []
+        var dataRows: [DataRow] = []
+        var isFirstRow = true
+
+        let rows = try await connection.query(finalSQL, []).get()
+
+        for row in rows {
+            // Get column names from first row using columnDefinitions
+            if isFirstRow {
+                columns = row.columnDefinitions.map { $0.name }
+                isFirstRow = false
+            }
+
+            var cells: [String: DatabaseValue] = [:]
+            for columnName in columns {
+                if let column = row.column(columnName) {
+                    cells[columnName] = extractValue(from: column)
+                }
+            }
+            dataRows.append(DataRow(cells: cells))
+        }
+
+        return SQLQueryResult(columns: columns, rows: dataRows)
     }
-    
+
     func close() async {
-        // Nothing to close in this simplified implementation
+        _ = try? await connection.close().get()
+    }
+
+    // Helper methods
+
+    /// MySQLの識別子（テーブル名、カラム名、スキーマ名）をエスケープする
+    /// バッククォートで囲み、内部のバッククォートは2つにエスケープする
+    private func escapeIdentifier(_ identifier: String) -> String {
+        let escaped = identifier.replacingOccurrences(of: "`", with: "``")
+        return "`\(escaped)`"
+    }
+
+    private func convertToMySQLData(_ value: DatabaseValue) -> MySQLData {
+        switch value {
+        case .null:
+            return MySQLData(type: .null, format: .text, buffer: nil, isUnsigned: false)
+        case .bool(let b):
+            return MySQLData(bool: b)
+        case .int(let i):
+            return MySQLData(int: i)
+        case .double(let d):
+            return MySQLData(double: d)
+        case .decimal(let s):
+            return MySQLData(string: s)
+        case .string(let s):
+            return MySQLData(string: s)
+        case .date(let date):
+            return MySQLData(date: date)
+        case .timestamp(let date):
+            return MySQLData(date: date)
+        case .blob(let data):
+            var buffer = ByteBufferAllocator().buffer(capacity: data.count)
+            buffer.writeBytes(data)
+            return MySQLData(type: .blob, format: .binary, buffer: buffer, isUnsigned: false)
+        case .json(let json):
+            return MySQLData(string: json)
+        case .array:
+            // 配列型はIN句で個別に処理されるため、ここには到達しないはず
+            // 念のためNULLを返す
+            return MySQLData(type: .null, format: .text, buffer: nil, isUnsigned: false)
+        }
+    }
+
+    private func buildWhereClause(from lock: ModificationRequest.OptimisticLock) -> (clause: String, bindings: [MySQLData]) {
+        switch lock.strategy {
+        case .primaryKey(let keys):
+            let clauses = keys.keys.map { "\(escapeIdentifier($0)) = ?" }.joined(separator: " AND ")
+            let bindings = keys.values.map { convertToMySQLData($0) }
+            return (clauses, bindings)
+        case .allColumns(let snapshot):
+            let clauses = snapshot.keys.map { "\(escapeIdentifier($0)) = ?" }.joined(separator: " AND ")
+            let bindings = snapshot.values.map { convertToMySQLData($0) }
+            return (clauses, bindings)
+        }
+    }
+
+    private func extractValue(from data: MySQLData) -> DatabaseValue {
+        if data.buffer == nil {
+            return .null
+        }
+
+        // Try different type conversions
+        // Note: Check int before bool, as MySQL TINYINT(1) can be interpreted as both
+        if let value = data.int {
+            return .int(value)
+        }
+        if let value = data.double {
+            return .double(value)
+        }
+        if let value = data.date {
+            return .timestamp(value)
+        }
+        if let value = data.string {
+            return .string(value)
+        }
+
+        return .null
     }
 }
 
@@ -615,8 +905,8 @@ actor SQLiteSession: DatabaseSession {
     
     func describe(table: DatabaseTable) async throws -> [DatabaseColumn] {
         try openDatabase()
-        
-        let sql = "PRAGMA table_info(\(table.name))"
+
+        let sql = "PRAGMA table_info(\(escapeIdentifier(table.name)))"
         var statement: OpaquePointer?
         
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -650,51 +940,81 @@ actor SQLiteSession: DatabaseSession {
     
     func execute(query: DataQueryRequest) async throws -> DataPage {
         try openDatabase()
-        
+
         // Build SELECT query
-        var sql = "SELECT * FROM \(query.table.name)"
-        
+        var sql = "SELECT * FROM \(escapeIdentifier(query.table.name))"
+        var bindingValues: [DatabaseValue] = []
+
         // Add WHERE clause for filters
         if !query.filters.isEmpty {
-            let filterClauses = query.filters.map { filter in
-                let op = switch filter.operation {
-                case .equals: "="
-                case .notEquals: "!="
-                case .greaterThan: ">"
-                case .lessThan: "<"
-                case .greaterThanOrEqual: ">="
-                case .lessThanOrEqual: "<="
-                case .like: "LIKE"
-                case .ilike: "LIKE" // SQLite doesn't have ILIKE, use LIKE
-                case .inSet: "IN"
+            var filterClauses: [String] = []
+            for filter in query.filters {
+                let escapedColumn = escapeIdentifier(filter.column)
+
+                switch filter.operation {
+                case .equals:
+                    filterClauses.append("\(escapedColumn) = ?")
+                    bindingValues.append(filter.value)
+                case .notEquals:
+                    filterClauses.append("\(escapedColumn) != ?")
+                    bindingValues.append(filter.value)
+                case .greaterThan:
+                    filterClauses.append("\(escapedColumn) > ?")
+                    bindingValues.append(filter.value)
+                case .lessThan:
+                    filterClauses.append("\(escapedColumn) < ?")
+                    bindingValues.append(filter.value)
+                case .greaterThanOrEqual:
+                    filterClauses.append("\(escapedColumn) >= ?")
+                    bindingValues.append(filter.value)
+                case .lessThanOrEqual:
+                    filterClauses.append("\(escapedColumn) <= ?")
+                    bindingValues.append(filter.value)
+                case .like:
+                    filterClauses.append("\(escapedColumn) LIKE ?")
+                    bindingValues.append(filter.value)
+                case .ilike:
+                    // SQLiteにはILIKEがないため、LOWER()を使用して大文字小文字を区別しない検索を実現
+                    filterClauses.append("LOWER(\(escapedColumn)) LIKE LOWER(?)")
+                    bindingValues.append(filter.value)
+                case .inSet:
+                    // IN句: 配列の各値に対してプレースホルダを生成
+                    if case .array(let values) = filter.value {
+                        let placeholders = values.map { _ in "?" }.joined(separator: ", ")
+                        filterClauses.append("\(escapedColumn) IN (\(placeholders))")
+                        bindingValues.append(contentsOf: values)
+                    } else {
+                        // 単一値の場合は従来通り
+                        filterClauses.append("\(escapedColumn) IN (?)")
+                        bindingValues.append(filter.value)
+                    }
                 }
-                return "\(filter.column) \(op) ?"
             }
             sql += " WHERE " + filterClauses.joined(separator: " AND ")
         }
-        
+
         // Add ORDER BY clause
         if !query.sorts.isEmpty {
             let sortClauses = query.sorts.map { sort in
-                "\(sort.column) \(sort.ascending ? "ASC" : "DESC")"
+                "\(escapeIdentifier(sort.column)) \(sort.ascending ? "ASC" : "DESC")"
             }
             sql += " ORDER BY " + sortClauses.joined(separator: ", ")
         }
-        
+
         // Add LIMIT and OFFSET
         sql += " LIMIT \(query.limit) OFFSET \(query.offset)"
-        
+
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
             let errorMessage = String(cString: sqlite3_errmsg(db))
             throw DatabaseDriverError.queryFailed(reason: "クエリの準備に失敗しました: \(errorMessage)")
         }
-        
+
         defer { sqlite3_finalize(statement) }
-        
+
         // Bind parameters for filters
-        for (index, filter) in query.filters.enumerated() {
-            try bindValue(statement: statement, index: Int32(index + 1), value: filter.value)
+        for (index, value) in bindingValues.enumerated() {
+            try bindValue(statement: statement, index: Int32(index + 1), value: value)
         }
         
         // Execute query and collect results
@@ -718,29 +1038,30 @@ actor SQLiteSession: DatabaseSession {
     
     func execute(modification: ModificationRequest) async throws -> ModificationResult {
         try openDatabase()
-        
+
         var sql: String
         var values: [DatabaseValue] = []
-        
+        let escapedTable = escapeIdentifier(modification.table.name)
+
         switch modification.operation {
         case .insert(let insertValues):
-            let columns = insertValues.keys.joined(separator: ", ")
-            let placeholders = String(repeating: "?", count: insertValues.count).split(separator: "").joined(separator: ", ")
-            sql = "INSERT INTO \(modification.table.name) (\(columns)) VALUES (\(placeholders))"
+            let columns = insertValues.keys.map { escapeIdentifier($0) }.joined(separator: ", ")
+            let placeholders = insertValues.keys.map { _ in "?" }.joined(separator: ", ")
+            sql = "INSERT INTO \(escapedTable) (\(columns)) VALUES (\(placeholders))"
             values = Array(insertValues.values)
-            
+
         case .update(let updateValues, let lock):
-            let setClauses = updateValues.keys.map { "\($0) = ?" }.joined(separator: ", ")
-            sql = "UPDATE \(modification.table.name) SET \(setClauses)"
+            let setClauses = updateValues.keys.map { "\(escapeIdentifier($0)) = ?" }.joined(separator: ", ")
+            sql = "UPDATE \(escapedTable) SET \(setClauses)"
             values = Array(updateValues.values)
-            
+
             // Add WHERE clause for optimistic lock
             let whereClause = try buildOptimisticLockWhereClause(lock: lock)
             sql += " WHERE \(whereClause.clause)"
             values.append(contentsOf: whereClause.values)
-            
+
         case .delete(let lock):
-            sql = "DELETE FROM \(modification.table.name)"
+            sql = "DELETE FROM \(escapedTable)"
             let whereClause = try buildOptimisticLockWhereClause(lock: lock)
             sql += " WHERE \(whereClause.clause)"
             values = whereClause.values
@@ -818,6 +1139,14 @@ actor SQLiteSession: DatabaseSession {
     }
     
     // Helper methods
+
+    /// SQLiteの識別子（テーブル名、カラム名）をエスケープする
+    /// ダブルクォートで囲み、内部のダブルクォートは2つにエスケープする
+    private func escapeIdentifier(_ identifier: String) -> String {
+        let escaped = identifier.replacingOccurrences(of: "\"", with: "\"\"")
+        return "\"\(escaped)\""
+    }
+
     private func bindValue(statement: OpaquePointer?, index: Int32, value: DatabaseValue) throws {
         switch value {
         case .null:
@@ -845,6 +1174,10 @@ actor SQLiteSession: DatabaseSession {
             }
         case .json(let json):
             sqlite3_bind_text(statement, index, json, -1, nil)
+        case .array:
+            // 配列型はIN句で個別に処理されるため、ここには到達しないはず
+            // 念のためNULLをバインド
+            sqlite3_bind_null(statement, index)
         }
     }
     
@@ -873,10 +1206,10 @@ actor SQLiteSession: DatabaseSession {
     private func buildOptimisticLockWhereClause(lock: ModificationRequest.OptimisticLock) throws -> (clause: String, values: [DatabaseValue]) {
         switch lock.strategy {
         case .primaryKey(let keys):
-            let clauses = keys.keys.map { "\($0) = ?" }.joined(separator: " AND ")
+            let clauses = keys.keys.map { "\(escapeIdentifier($0)) = ?" }.joined(separator: " AND ")
             return (clauses, Array(keys.values))
         case .allColumns(let snapshot):
-            let clauses = snapshot.keys.map { "\($0) = ?" }.joined(separator: " AND ")
+            let clauses = snapshot.keys.map { "\(escapeIdentifier($0)) = ?" }.joined(separator: " AND ")
             return (clauses, Array(snapshot.values))
         }
     }

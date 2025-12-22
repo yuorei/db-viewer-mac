@@ -212,4 +212,6 @@ public enum DatabaseValue: Sendable, Equatable, Hashable {
     case timestamp(Date)
     case blob(Data)
     case json(String)
+    /// IN句で使用する複数値の配列
+    case array([DatabaseValue])
 }
