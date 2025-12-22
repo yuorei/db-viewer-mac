@@ -472,6 +472,10 @@ actor PostgreSQLSession: DatabaseSession {
             return "E'\\\\x\(data.map { String(format: "%02x", $0) }.joined())'"
         case .json(let json):
             return "'\(json.replacingOccurrences(of: "'", with: "''"))'::jsonb"
+        case .array(let values):
+            // IN句用: (value1, value2, ...)
+            let formattedValues = values.map { formatValue($0) }.joined(separator: ", ")
+            return "(\(formattedValues))"
         }
     }
 
@@ -617,19 +621,48 @@ actor MySQLSession: DatabaseSession {
         if !query.filters.isEmpty {
             var filterClauses: [String] = []
             for filter in query.filters {
-                let op = switch filter.operation {
-                case .equals: "="
-                case .notEquals: "!="
-                case .greaterThan: ">"
-                case .lessThan: "<"
-                case .greaterThanOrEqual: ">="
-                case .lessThanOrEqual: "<="
-                case .like: "LIKE"
-                case .ilike: "LIKE"  // MySQL doesn't have ILIKE
-                case .inSet: "IN"
+                let escapedColumn = escapeIdentifier(filter.column)
+
+                switch filter.operation {
+                case .equals:
+                    filterClauses.append("\(escapedColumn) = ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .notEquals:
+                    filterClauses.append("\(escapedColumn) != ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .greaterThan:
+                    filterClauses.append("\(escapedColumn) > ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .lessThan:
+                    filterClauses.append("\(escapedColumn) < ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .greaterThanOrEqual:
+                    filterClauses.append("\(escapedColumn) >= ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .lessThanOrEqual:
+                    filterClauses.append("\(escapedColumn) <= ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .like:
+                    filterClauses.append("\(escapedColumn) LIKE ?")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .ilike:
+                    // MySQLにはILIKEがないため、LOWER()を使用して大文字小文字を区別しない検索を実現
+                    filterClauses.append("LOWER(\(escapedColumn)) LIKE LOWER(?)")
+                    bindings.append(convertToMySQLData(filter.value))
+                case .inSet:
+                    // IN句: 配列の各値に対してプレースホルダを生成
+                    if case .array(let values) = filter.value {
+                        let placeholders = values.map { _ in "?" }.joined(separator: ", ")
+                        filterClauses.append("\(escapedColumn) IN (\(placeholders))")
+                        for value in values {
+                            bindings.append(convertToMySQLData(value))
+                        }
+                    } else {
+                        // 単一値の場合は従来通り
+                        filterClauses.append("\(escapedColumn) IN (?)")
+                        bindings.append(convertToMySQLData(filter.value))
+                    }
                 }
-                filterClauses.append("\(escapeIdentifier(filter.column)) \(op) ?")
-                bindings.append(convertToMySQLData(filter.value))
             }
             sql += " WHERE " + filterClauses.joined(separator: " AND ")
         }
@@ -778,6 +811,10 @@ actor MySQLSession: DatabaseSession {
             return MySQLData(type: .blob, format: .binary, buffer: buffer, isUnsigned: false)
         case .json(let json):
             return MySQLData(string: json)
+        case .array:
+            // 配列型はIN句で個別に処理されるため、ここには到達しないはず
+            // 念のためNULLを返す
+            return MySQLData(type: .null, format: .text, buffer: nil, isUnsigned: false)
         }
     }
 
@@ -906,22 +943,52 @@ actor SQLiteSession: DatabaseSession {
 
         // Build SELECT query
         var sql = "SELECT * FROM \(escapeIdentifier(query.table.name))"
+        var bindingValues: [DatabaseValue] = []
 
         // Add WHERE clause for filters
         if !query.filters.isEmpty {
-            let filterClauses = query.filters.map { filter in
-                let op = switch filter.operation {
-                case .equals: "="
-                case .notEquals: "!="
-                case .greaterThan: ">"
-                case .lessThan: "<"
-                case .greaterThanOrEqual: ">="
-                case .lessThanOrEqual: "<="
-                case .like: "LIKE"
-                case .ilike: "LIKE" // SQLite doesn't have ILIKE, use LIKE
-                case .inSet: "IN"
+            var filterClauses: [String] = []
+            for filter in query.filters {
+                let escapedColumn = escapeIdentifier(filter.column)
+
+                switch filter.operation {
+                case .equals:
+                    filterClauses.append("\(escapedColumn) = ?")
+                    bindingValues.append(filter.value)
+                case .notEquals:
+                    filterClauses.append("\(escapedColumn) != ?")
+                    bindingValues.append(filter.value)
+                case .greaterThan:
+                    filterClauses.append("\(escapedColumn) > ?")
+                    bindingValues.append(filter.value)
+                case .lessThan:
+                    filterClauses.append("\(escapedColumn) < ?")
+                    bindingValues.append(filter.value)
+                case .greaterThanOrEqual:
+                    filterClauses.append("\(escapedColumn) >= ?")
+                    bindingValues.append(filter.value)
+                case .lessThanOrEqual:
+                    filterClauses.append("\(escapedColumn) <= ?")
+                    bindingValues.append(filter.value)
+                case .like:
+                    filterClauses.append("\(escapedColumn) LIKE ?")
+                    bindingValues.append(filter.value)
+                case .ilike:
+                    // SQLiteにはILIKEがないため、LOWER()を使用して大文字小文字を区別しない検索を実現
+                    filterClauses.append("LOWER(\(escapedColumn)) LIKE LOWER(?)")
+                    bindingValues.append(filter.value)
+                case .inSet:
+                    // IN句: 配列の各値に対してプレースホルダを生成
+                    if case .array(let values) = filter.value {
+                        let placeholders = values.map { _ in "?" }.joined(separator: ", ")
+                        filterClauses.append("\(escapedColumn) IN (\(placeholders))")
+                        bindingValues.append(contentsOf: values)
+                    } else {
+                        // 単一値の場合は従来通り
+                        filterClauses.append("\(escapedColumn) IN (?)")
+                        bindingValues.append(filter.value)
+                    }
                 }
-                return "\(escapeIdentifier(filter.column)) \(op) ?"
             }
             sql += " WHERE " + filterClauses.joined(separator: " AND ")
         }
@@ -933,21 +1000,21 @@ actor SQLiteSession: DatabaseSession {
             }
             sql += " ORDER BY " + sortClauses.joined(separator: ", ")
         }
-        
+
         // Add LIMIT and OFFSET
         sql += " LIMIT \(query.limit) OFFSET \(query.offset)"
-        
+
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
             let errorMessage = String(cString: sqlite3_errmsg(db))
             throw DatabaseDriverError.queryFailed(reason: "クエリの準備に失敗しました: \(errorMessage)")
         }
-        
+
         defer { sqlite3_finalize(statement) }
-        
+
         // Bind parameters for filters
-        for (index, filter) in query.filters.enumerated() {
-            try bindValue(statement: statement, index: Int32(index + 1), value: filter.value)
+        for (index, value) in bindingValues.enumerated() {
+            try bindValue(statement: statement, index: Int32(index + 1), value: value)
         }
         
         // Execute query and collect results
@@ -1107,6 +1174,10 @@ actor SQLiteSession: DatabaseSession {
             }
         case .json(let json):
             sqlite3_bind_text(statement, index, json, -1, nil)
+        case .array:
+            // 配列型はIN句で個別に処理されるため、ここには到達しないはず
+            // 念のためNULLをバインド
+            sqlite3_bind_null(statement, index)
         }
     }
     

@@ -257,6 +257,10 @@ public extension DatabaseSession {
             return "'\(data.base64EncodedString())'"
         case .json(let json):
             return "'\(json.replacingOccurrences(of: "'", with: "''"))'"
+        case .array(let values):
+            // IN句用: (value1, value2, ...)
+            let formattedValues = values.map { formatValueForSQL($0) }.joined(separator: ", ")
+            return "(\(formattedValues))"
         }
     }
 }

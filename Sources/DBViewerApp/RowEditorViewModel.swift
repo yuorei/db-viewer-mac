@@ -211,6 +211,8 @@ final class RowEditorViewModel: ObservableObject, Identifiable {
             return ""
         case .json(let json):
             return json
+        case .array(let values):
+            return values.map { displayText(for: $0) }.joined(separator: ", ")
         }
     }
 }
