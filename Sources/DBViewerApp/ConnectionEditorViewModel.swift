@@ -28,7 +28,20 @@ final class ConnectionEditorViewModel: ObservableObject, Identifiable {
     let mode: Mode
 
     @Published var name: String
-    @Published var engine: DatabaseEngine
+    @Published var engine: DatabaseEngine {
+        didSet {
+            if engine != oldValue {
+                // エンジン変更時にデフォルトポートを設定
+                port = String(Self.defaultPort(for: engine))
+                // SQLiteの場合はデータベース名をファイルパス用にクリア
+                if engine == .sqlite {
+                    host = ""
+                    username = ""
+                    database = ""
+                }
+            }
+        }
+    }
     @Published var host: String
     @Published var port: String
     @Published var database: String

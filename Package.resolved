@@ -1,6 +1,15 @@
 {
-  "originHash" : "a6c4ba72c0b925f90a3fbba9a62d7925e9f7c907a83f56a598a23ce6b15baa66",
+  "originHash" : "8ae4cc62e3a2707b886b0a5b1e2c1760e5e97905a29a0148157f833aeda4a00f",
   "pins" : [
+    {
+      "identity" : "mysql-nio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/vapor/mysql-nio.git",
+      "state" : {
+        "revision" : "853b43413941a7fc0cfe44ef0ae81b6dd049f8e5",
+        "version" : "1.8.0"
+      }
+    },
     {
       "identity" : "postgres-nio",
       "kind" : "remoteSourceControl",
@@ -8,6 +17,15 @@
       "state" : {
         "revision" : "4795a0b0762c5cca843a720969c9dfee378e5120",
         "version" : "1.29.0"
+      }
+    },
+    {
+      "identity" : "swift-algorithms",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-algorithms.git",
+      "state" : {
+        "revision" : "87e50f483c54e6efd60e885f7f5aa946cee68023",
+        "version" : "1.2.1"
       }
     },
     {
@@ -98,6 +116,15 @@
       "state" : {
         "revision" : "df6c28355051c72c884574a6c858bc54f7311ff9",
         "version" : "1.25.2"
+      }
+    },
+    {
+      "identity" : "swift-numerics",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-numerics.git",
+      "state" : {
+        "revision" : "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
+        "version" : "1.1.1"
       }
     },
     {

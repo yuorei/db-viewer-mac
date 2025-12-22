@@ -13,13 +13,15 @@ let package = Package(
         .executable(name: "db-viewer", targets: ["DBViewerApp"])
     ],
     dependencies: [
-        .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.21.0")
+        .package(url: "https://github.com/vapor/postgres-nio.git", from: "1.21.0"),
+        .package(url: "https://github.com/vapor/mysql-nio.git", from: "1.6.0")
     ],
     targets: [
         .target(
             name: "DBViewerCore",
             dependencies: [
-                .product(name: "PostgresNIO", package: "postgres-nio")
+                .product(name: "PostgresNIO", package: "postgres-nio"),
+                .product(name: "MySQLNIO", package: "mysql-nio")
             ],
             linkerSettings: [
                 .linkedLibrary("sqlite3")
@@ -31,6 +33,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "PostgresTest",
+            dependencies: ["DBViewerCore"]
+        ),
+        .executableTarget(
+            name: "MySQLTest",
             dependencies: ["DBViewerCore"]
         )
     ]
