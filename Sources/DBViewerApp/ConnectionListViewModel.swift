@@ -326,7 +326,7 @@ final class ConnectionListViewModel: ObservableObject {
         }
     }
 
-    private func withSession<T>(_ action: (DatabaseSession) async throws -> T) async throws -> T {
+    private func withSession<T: Sendable>(_ action: @Sendable (DatabaseSession) async throws -> T) async throws -> T {
         guard let connection = selectedConnection,
               let driver = driverRegistry.driver(for: connection.engine) else {
             throw DatabaseDriverError.unsupported
