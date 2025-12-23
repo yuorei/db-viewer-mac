@@ -15,7 +15,7 @@ public struct ConnectionStoreConfiguration: Sendable {
     }
 }
 
-public final class FileConnectionStore: ConnectionStore, @unchecked Sendable {
+public actor FileConnectionStore: ConnectionStore {
     private let configuration: ConnectionStoreConfiguration
     private let fileManager: FileManager
     private let encoder: JSONEncoder

@@ -82,6 +82,9 @@ public final class DefaultKeychainService: KeychainService {
     }
 }
 
+// Note: @unchecked Sendable is used because:
+// 1. All mutable state access is protected by NSLock
+// 2. KeychainService protocol methods are synchronous, preventing use of actor
 public final class InMemoryKeychainService: KeychainService, @unchecked Sendable {
     private var storage: [String: String] = [:]
     private let lock = NSLock()

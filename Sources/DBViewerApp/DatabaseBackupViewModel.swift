@@ -1,5 +1,8 @@
 import Foundation
 import DBViewerCore
+#if canImport(AppKit)
+import AppKit
+#endif
 
 @MainActor
 final class DatabaseBackupViewModel: ObservableObject {
@@ -10,34 +13,31 @@ final class DatabaseBackupViewModel: ObservableObject {
     @Published var selectedTables: Set<DatabaseTable> = []
     @Published var availableTables: [DatabaseTable] = []
     @Published var isLoadingTables: Bool = false
-    
+
     private let connection: ConnectionProfile
     private let driver: DatabaseDriver
-    
+
     init(connection: ConnectionProfile, driver: DatabaseDriver) {
         self.connection = connection
         self.driver = driver
     }
-    
+
     func loadAvailableTables() {
         isLoadingTables = true
         errorMessage = nil
-        
+
         Task {
             do {
-                let session = try await driver.openSession(using: connection)
-                defer { 
-                    Task { await session.close() }
+                let allTables = try await withSession { session in
+                    let schemas = try await session.listSchemas()
+                    var tables: [DatabaseTable] = []
+                    for schema in schemas {
+                        let schemaTables = try await session.listTables(in: schema.name)
+                        tables.append(contentsOf: schemaTables)
+                    }
+                    return tables
                 }
-                
-                let schemas = try await session.listSchemas()
-                var allTables: [DatabaseTable] = []
-                
-                for schema in schemas {
-                    let tables = try await session.listTables(in: schema.name)
-                    allTables.append(contentsOf: tables)
-                }
-                
+
                 await MainActor.run {
                     self.availableTables = allTables.sorted { $0.fullyQualifiedName < $1.fullyQualifiedName }
                     self.isLoadingTables = false
@@ -50,22 +50,20 @@ final class DatabaseBackupViewModel: ObservableObject {
             }
         }
     }
-    
+
     func generateBackup() {
         isGeneratingBackup = true
         errorMessage = nil
         statusMessage = nil
-        
+
         let tablesToBackup = selectedTables.isEmpty ? nil : Array(selectedTables)
-        
+
         Task {
             do {
-                let session = try await driver.openSession(using: connection)
-                defer { 
-                    Task { await session.close() }
+                let sql = try await withSession { session in
+                    try await session.generateBackupSQL(for: tablesToBackup)
                 }
-                
-                let sql = try await session.generateBackupSQL(for: tablesToBackup)
+
                 await MainActor.run {
                     self.backupSQL = sql
                     self.statusMessage = self.makeStatusMessage(tableCount: tablesToBackup?.count ?? self.availableTables.count)
@@ -77,6 +75,18 @@ final class DatabaseBackupViewModel: ObservableObject {
                     self.isGeneratingBackup = false
                 }
             }
+        }
+    }
+
+    private func withSession<T: Sendable>(_ action: @Sendable (DatabaseSession) async throws -> T) async throws -> T {
+        let session = try await driver.openSession(using: connection)
+        do {
+            let result = try await action(session)
+            await session.close()
+            return result
+        } catch {
+            await session.close()
+            throw error
         }
     }
     
@@ -131,7 +141,3 @@ final class DatabaseBackupViewModel: ObservableObject {
         return formatter
     }()
 }
-
-#if canImport(AppKit)
-import AppKit
-#endif

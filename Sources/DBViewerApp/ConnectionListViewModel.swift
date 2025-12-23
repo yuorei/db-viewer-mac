@@ -65,10 +65,14 @@ final class ConnectionListViewModel: ObservableObject {
     private let dependencies: Dependencies
     private let driverRegistry: DatabaseDriverRegistry
     private let pageSize: Int = 100
-    private let sqlPreviewLimit: Int = 200
     private var tablePageIndex: Int = 0
     private var skipNextSelectionRefresh = false
     private var pendingTableRefresh = false
+
+    // Session cache to avoid opening a new connection for each operation
+    private var cachedSession: DatabaseSession?
+    private var cachedConnectionId: UUID?
+
     lazy var sqlConsoleViewModel: SQLConsoleViewModel = {
         SQLConsoleViewModel(
             runner: { [weak self] sql in
@@ -146,6 +150,11 @@ final class ConnectionListViewModel: ObservableObject {
         guard let target = deleteTarget else { return }
         Task {
             do {
+                // Close cached session if deleting the current connection
+                if cachedConnectionId == target.id {
+                    await closeSession()
+                }
+
                 let updatedConnections = try await dependencies.connectionStore.delete(target)
                 await MainActor.run {
                     self.connections = updatedConnections
@@ -187,7 +196,7 @@ final class ConnectionListViewModel: ObservableObject {
 
     private func executeSQL(sql: String) async throws -> SQLQueryResult {
         try await withSession { session in
-            try await session.execute(sql: sql, limit: sqlPreviewLimit)
+            try await session.execute(sql: sql, limit: nil)
         }
     }
 
@@ -207,17 +216,17 @@ final class ConnectionListViewModel: ObservableObject {
         }
 
         do {
-            let session = try await driver.openSession(using: connection)
-            let schemaList = try await session.listSchemas()
+            let schemasWithTables = try await withSession { session in
+                let schemaList = try await session.listSchemas()
 
-            // 各スキーマのテーブル一覧を取得
-            var schemasWithTables: [DatabaseSchema] = []
-            for schema in schemaList {
-                let tables = try await session.listTables(in: schema.name)
-                schemasWithTables.append(DatabaseSchema(name: schema.name, tables: tables))
+                // 各スキーマのテーブル一覧を取得
+                var result: [DatabaseSchema] = []
+                for schema in schemaList {
+                    let tables = try await session.listTables(in: schema.name)
+                    result.append(DatabaseSchema(name: schema.name, tables: tables))
+                }
+                return result
             }
-
-            await session.close()
 
             // Initialize backup view model with driver and connection info
             backupViewModel = DatabaseBackupViewModel(connection: connection, driver: driver)
@@ -332,14 +341,32 @@ final class ConnectionListViewModel: ObservableObject {
             throw DatabaseDriverError.unsupported
         }
 
+        // Use cached session if available and connection hasn't changed
+        if let cached = cachedSession, cachedConnectionId == connection.id {
+            return try await action(cached)
+        }
+
+        // Close existing cached session if connection changed
+        if let oldSession = cachedSession {
+            await oldSession.close()
+            cachedSession = nil
+            cachedConnectionId = nil
+        }
+
+        // Open new session and cache it
         let session = try await driver.openSession(using: connection)
-        do {
-            let value = try await action(session)
+        cachedSession = session
+        cachedConnectionId = connection.id
+
+        return try await action(session)
+    }
+
+    /// Closes the cached session. Call this when the connection is deleted or the view is dismissed.
+    func closeSession() async {
+        if let session = cachedSession {
             await session.close()
-            return value
-        } catch {
-            await session.close()
-            throw error
+            cachedSession = nil
+            cachedConnectionId = nil
         }
     }
 
@@ -488,96 +515,10 @@ final class ConnectionListViewModel: ObservableObject {
     }
 
     private func writeBackup(for table: DatabaseTable, to destination: URL) async throws {
-        let snapshot = try await fetchTableSnapshot(for: table)
-        let sql = makeBackupSQL(for: table, snapshot: snapshot)
+        let sql = try await withSession { session in
+            try await session.generateBackupSQL(for: [table])
+        }
         try sql.write(to: destination, atomically: true, encoding: .utf8)
-    }
-
-    private func fetchTableSnapshot(for table: DatabaseTable) async throws -> (columns: [DatabaseColumn], rows: [DataRow]) {
-        try await withSession { session in
-            let columns = try await session.describe(table: table)
-            var rows: [DataRow] = []
-            var offset = 0
-            let limit = pageSize
-
-            while true {
-                let request = DataQueryRequest(table: table, limit: limit, offset: offset)
-                let page = try await session.execute(query: request)
-                rows.append(contentsOf: page.rows)
-                guard page.hasMore else { break }
-                offset += page.rows.count
-                if page.rows.isEmpty {
-                    break
-                }
-            }
-
-            return (columns, rows)
-        }
-    }
-
-    private func makeBackupSQL(for table: DatabaseTable, snapshot: (columns: [DatabaseColumn], rows: [DataRow])) -> String {
-        var lines: [String] = []
-        let timestamp = backupDateFormatter.string(from: Date())
-        lines.append("-- Backup for \(table.fullyQualifiedName) at \(timestamp)")
-        lines.append("BEGIN TRANSACTION;")
-
-        let columnNames = snapshot.columns.map { escapeIdentifier($0.name) }
-        let columnList = columnNames.joined(separator: ", ")
-        let qualifiedName = "\(escapeIdentifier(table.schema)).\(escapeIdentifier(table.name))"
-
-        if snapshot.rows.isEmpty {
-            lines.append("-- No rows to export")
-        } else {
-            for row in snapshot.rows {
-                let values = snapshot.columns.map { column in
-                    sqlLiteral(for: row.cells[column.name])
-                }
-                let valueList = values.joined(separator: ", ")
-                lines.append("INSERT INTO \(qualifiedName) (\(columnList)) VALUES (\(valueList));")
-            }
-        }
-
-        lines.append("COMMIT;")
-        return lines.joined(separator: "\n") + "\n"
-    }
-
-    private func sqlLiteral(for value: DatabaseValue?) -> String {
-        guard let value else { return "NULL" }
-
-        switch value {
-        case .null:
-            return "NULL"
-        case .bool(let bool):
-            return bool ? "TRUE" : "FALSE"
-        case .int(let int):
-            return String(int)
-        case .double(let double):
-            return String(double)
-        case .decimal(let string):
-            return string
-        case .string(let string):
-            return "'\(escapeStringLiteral(string))'"
-        case .date(let date), .timestamp(let date):
-            return "'\(iso8601Formatter.string(from: date))'"
-        case .blob(let data):
-            let hex = data.map { String(format: "%02X", $0) }.joined()
-            return "X'\(hex)'"
-        case .json(let json):
-            return "'\(escapeStringLiteral(json))'"
-        case .array(let values):
-            let formattedValues = values.map { sqlLiteral(for: $0) }.joined(separator: ", ")
-            return "(\(formattedValues))"
-        }
-    }
-
-    private func escapeIdentifier(_ value: String) -> String {
-        "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
-    }
-
-    private func escapeStringLiteral(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "'", with: "''")
     }
 
     private func requestBackupDestination(for table: DatabaseTable) async -> URL? {
@@ -674,13 +615,6 @@ final class ConnectionListViewModel: ObservableObject {
         }
     }
 }
-
-@MainActor
-private let iso8601Formatter: ISO8601DateFormatter = {
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return formatter
-}()
 
 @MainActor
 private let backupDateFormatter: DateFormatter = {
