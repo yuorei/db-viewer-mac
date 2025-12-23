@@ -6,7 +6,26 @@ import NIOCore
 import NIOPosix
 import Logging
 
+// MARK: - Helper Functions
+
+/// Checks if SQL query already contains a LIMIT clause to avoid adding duplicate LIMIT
+private func containsLimitClause(_ sql: String) -> Bool {
+    let uppercased = sql.uppercased()
+    // Check for LIMIT keyword not inside quotes
+    // Simple check: look for LIMIT followed by a number or whitespace
+    let pattern = "\\bLIMIT\\s+\\d+"
+    if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+        let range = NSRange(sql.startIndex..<sql.endIndex, in: sql)
+        return regex.firstMatch(in: sql, options: [], range: range) != nil
+    }
+    return uppercased.contains("LIMIT ")
+}
+
+// MARK: - PostgreSQL Driver
+
 // PostgreSQL Driver - Real implementation using PostgresNIO
+// Note: @unchecked Sendable is safe here because eventLoopGroup is immutable after initialization
+// and MultiThreadedEventLoopGroup is internally thread-safe.
 public final class PostgreSQLDriver: DatabaseDriver, @unchecked Sendable {
     public let engine: DatabaseEngine = .postgres
     private let eventLoopGroup: MultiThreadedEventLoopGroup
@@ -16,7 +35,15 @@ public final class PostgreSQLDriver: DatabaseDriver, @unchecked Sendable {
     }
 
     deinit {
+        // Note: syncShutdownGracefully is a blocking call. For proper cleanup,
+        // call shutdown() explicitly before the driver is deallocated.
         try? eventLoopGroup.syncShutdownGracefully()
+    }
+
+    /// Gracefully shuts down the event loop group.
+    /// Call this method when the driver is no longer needed.
+    public func shutdown() async throws {
+        try await eventLoopGroup.shutdownGracefully()
     }
 
     public func testConnection(using profile: ConnectionProfile) async throws {
@@ -89,6 +116,8 @@ public final class PostgreSQLDriver: DatabaseDriver, @unchecked Sendable {
 }
 
 // MySQL Driver - Real implementation using MySQLNIO
+// Note: @unchecked Sendable is safe here because eventLoopGroup is immutable after initialization
+// and MultiThreadedEventLoopGroup is internally thread-safe.
 public final class MySQLDriver: DatabaseDriver, @unchecked Sendable {
     public let engine: DatabaseEngine = .mysql
     private let eventLoopGroup: MultiThreadedEventLoopGroup
@@ -98,7 +127,15 @@ public final class MySQLDriver: DatabaseDriver, @unchecked Sendable {
     }
 
     deinit {
+        // Note: syncShutdownGracefully is a blocking call. For proper cleanup,
+        // call shutdown() explicitly before the driver is deallocated.
         try? eventLoopGroup.syncShutdownGracefully()
+    }
+
+    /// Gracefully shuts down the event loop group.
+    /// Call this method when the driver is no longer needed.
+    public func shutdown() async throws {
+        try await eventLoopGroup.shutdownGracefully()
     }
 
     public func testConnection(using profile: ConnectionProfile) async throws {
@@ -232,16 +269,16 @@ actor PostgreSQLSession: DatabaseSession {
     }
 
     func listTables(in schema: String) async throws -> [DatabaseTable] {
-        let escapedSchema = escapeStringLiteral(schema)
-        let sql = """
+        var tables: [DatabaseTable] = []
+        let rows = try await connection.query(
+            """
             SELECT table_name, table_type
             FROM information_schema.tables
-            WHERE table_schema = '\(escapedSchema)'
+            WHERE table_schema = \(schema)
             ORDER BY table_name
-            """
-
-        var tables: [DatabaseTable] = []
-        let rows = try await connection.query(PostgresQuery(unsafeSQL: sql), logger: logger)
+            """,
+            logger: logger
+        )
         for try await row in rows {
             let randomAccessRow = row.makeRandomAccess()
             if let name = try? randomAccessRow[0].decode(String.self),
@@ -254,9 +291,9 @@ actor PostgreSQLSession: DatabaseSession {
     }
 
     func describe(table: DatabaseTable) async throws -> [DatabaseColumn] {
-        let escapedSchema = escapeStringLiteral(table.schema)
-        let escapedTable = escapeStringLiteral(table.name)
-        let sql = """
+        var columns: [DatabaseColumn] = []
+        let rows = try await connection.query(
+            """
             SELECT
                 c.column_name,
                 c.data_type,
@@ -269,17 +306,16 @@ actor PostgreSQLSession: DatabaseSession {
                 FROM information_schema.table_constraints tc
                 JOIN information_schema.key_column_usage ku
                     ON tc.constraint_name = ku.constraint_name
-                WHERE tc.table_schema = '\(escapedSchema)'
-                    AND tc.table_name = '\(escapedTable)'
+                WHERE tc.table_schema = \(table.schema)
+                    AND tc.table_name = \(table.name)
                     AND tc.constraint_type = 'PRIMARY KEY'
             ) pk ON c.column_name = pk.column_name
-            WHERE c.table_schema = '\(escapedSchema)'
-                AND c.table_name = '\(escapedTable)'
+            WHERE c.table_schema = \(table.schema)
+                AND c.table_name = \(table.name)
             ORDER BY c.ordinal_position
-            """
-
-        var columns: [DatabaseColumn] = []
-        let rows = try await connection.query(PostgresQuery(unsafeSQL: sql), logger: logger)
+            """,
+            logger: logger
+        )
         for try await row in rows {
             let randomAccessRow = row.makeRandomAccess()
             guard let name = try? randomAccessRow[0].decode(String.self),
@@ -430,6 +466,9 @@ actor PostgreSQLSession: DatabaseSession {
     }
 
     func close() async {
+        // Note: Errors during connection close are intentionally ignored
+        // as the DatabaseSession protocol's close() method is not throwing.
+        // In production, consider logging connection close errors for debugging.
         try? await connection.close()
     }
 
@@ -440,11 +479,6 @@ actor PostgreSQLSession: DatabaseSession {
     private func escapeIdentifier(_ identifier: String) -> String {
         let escaped = identifier.replacingOccurrences(of: "\"", with: "\"\"")
         return "\"\(escaped)\""
-    }
-
-    /// PostgreSQLの文字列リテラルをエスケープする
-    private func escapeStringLiteral(_ value: String) -> String {
-        return value.replacingOccurrences(of: "'", with: "''")
     }
 
     private func formatValue(_ value: DatabaseValue) -> String {
@@ -745,7 +779,8 @@ actor MySQLSession: DatabaseSession {
             finalSQL = String(finalSQL.dropLast())
         }
 
-        if let limit = limit {
+        // Only add LIMIT if user hasn't specified one
+        if let limit = limit, !containsLimitClause(finalSQL) {
             finalSQL += " LIMIT \(limit)"
         }
 
@@ -775,6 +810,9 @@ actor MySQLSession: DatabaseSession {
     }
 
     func close() async {
+        // Note: Errors during connection close are intentionally ignored
+        // as the DatabaseSession protocol's close() method is not throwing.
+        // In production, consider logging connection close errors for debugging.
         _ = try? await connection.close().get()
     }
 
@@ -1091,12 +1129,17 @@ actor SQLiteSession: DatabaseSession {
     
     func execute(sql: String, limit: Int?) async throws -> SQLQueryResult {
         try openDatabase()
-        
-        var finalSQL = sql
-        if let limit = limit {
+
+        var finalSQL = sql.trimmingCharacters(in: .whitespacesAndNewlines)
+        if finalSQL.hasSuffix(";") {
+            finalSQL = String(finalSQL.dropLast())
+        }
+
+        // Only add LIMIT if user hasn't specified one
+        if let limit = limit, !containsLimitClause(finalSQL) {
             finalSQL += " LIMIT \(limit)"
         }
-        
+
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, finalSQL, -1, &statement, nil) == SQLITE_OK else {
             let errorMessage = String(cString: sqlite3_errmsg(db))
@@ -1181,9 +1224,9 @@ actor SQLiteSession: DatabaseSession {
         }
     }
     
-    private func extractValue(statement: OpaquePointer?, index: Int32) -> DatabaseValue? {
+    private func extractValue(statement: OpaquePointer?, index: Int32) -> DatabaseValue {
         let type = sqlite3_column_type(statement, index)
-        
+
         switch type {
         case SQLITE_NULL:
             return .null
@@ -1195,8 +1238,10 @@ actor SQLiteSession: DatabaseSession {
             return .string(String(cString: sqlite3_column_text(statement, index)))
         case SQLITE_BLOB:
             let length = sqlite3_column_bytes(statement, index)
-            let bytes = sqlite3_column_blob(statement, index)
-            let data = Data(bytes: bytes!, count: Int(length))
+            guard let bytes = sqlite3_column_blob(statement, index) else {
+                return .null
+            }
+            let data = Data(bytes: bytes, count: Int(length))
             return .blob(data)
         default:
             return .null

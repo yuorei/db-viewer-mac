@@ -308,7 +308,7 @@ public enum StubDrivers {
         )
     )
     
-    public var session: DatabaseSession {
+    public static func makeTestSession() -> DatabaseSession {
         let profile = ConnectionProfile(
             name: "Test Connection",
             engine: .postgres,
@@ -318,7 +318,7 @@ public enum StubDrivers {
             username: "testuser",
             credential: CredentialReference(storage: .inline("password"))
         )
-        
-        return StubDrivers.postgres.makeSession(with: profile)
+
+        return postgres.makeSession(with: profile)
     }
 }
