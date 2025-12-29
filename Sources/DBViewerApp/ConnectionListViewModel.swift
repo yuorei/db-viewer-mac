@@ -73,6 +73,9 @@ final class ConnectionListViewModel: ObservableObject {
     private var cachedSession: DatabaseSession?
     private var cachedConnectionId: UUID?
 
+    // Task tracking to cancel previous operations when switching connections
+    private var loadSchemasTask: Task<Void, Never>?
+
     lazy var sqlConsoleViewModel: SQLConsoleViewModel = {
         SQLConsoleViewModel(
             runner: { [weak self] sql in
@@ -210,10 +213,24 @@ final class ConnectionListViewModel: ObservableObject {
     }
 
     func loadSchemas() async {
+        // Cancel any previous loadSchemas task
+        loadSchemasTask?.cancel()
+
         guard let connection = selectedConnection,
               let driver = driverRegistry.driver(for: connection.engine) else {
             return
         }
+
+        // Close cached session if connection changed
+        if cachedConnectionId != connection.id {
+            if let oldSession = cachedSession {
+                await oldSession.close()
+                cachedSession = nil
+                cachedConnectionId = nil
+            }
+        }
+
+        let connectionId = connection.id
 
         do {
             let schemasWithTables = try await withSession { session in
@@ -222,11 +239,16 @@ final class ConnectionListViewModel: ObservableObject {
                 // 各スキーマのテーブル一覧を取得
                 var result: [DatabaseSchema] = []
                 for schema in schemaList {
+                    // Check if task was cancelled or connection changed
+                    try Task.checkCancellation()
                     let tables = try await session.listTables(in: schema.name)
                     result.append(DatabaseSchema(name: schema.name, tables: tables))
                 }
                 return result
             }
+
+            // Only update state if this is still the selected connection
+            guard selectedConnection?.id == connectionId else { return }
 
             // Initialize backup view model with driver and connection info
             backupViewModel = DatabaseBackupViewModel(connection: connection, driver: driver)
@@ -237,7 +259,11 @@ final class ConnectionListViewModel: ObservableObject {
             reconcileSelection(with: schemasWithTables)
             await loadSelectedTable(reset: true)
             skipNextSelectionRefresh = false
+        } catch is CancellationError {
+            // Task was cancelled, ignore
         } catch {
+            // Only set error if this is still the selected connection
+            guard selectedConnection?.id == connectionId else { return }
             errorMessage = error.localizedDescription
             backupViewModel = nil
         }
