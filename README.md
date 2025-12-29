@@ -41,8 +41,8 @@ macOS 向けのデータベースビューアアプリケーションです。Po
 
 ```bash
 # リポジトリをクローン
-git clone https://github.com/yuorei/db-viewer.git
-cd db-viewer
+git clone https://github.com/yuorei/db-viewer-mac.git
+cd db-viewer-mac
 
 # ビルド
 swift build
