@@ -31,9 +31,14 @@ struct MySQLTest {
             session = try await driver.openSession(using: profile)
             print("   ✓ セッション開始成功\n")
 
+            guard let activeSession = session else {
+                print("エラー: セッションがnilです")
+                return
+            }
+
             // スキーマ一覧
             print("3. スキーマ一覧:")
-            let schemas = try await session!.listSchemas()
+            let schemas = try await activeSession.listSchemas()
             for schema in schemas {
                 print("   - \(schema.name)")
             }
@@ -41,7 +46,7 @@ struct MySQLTest {
 
             // テーブル一覧
             print("4. テーブル一覧 (mydb):")
-            let tables = try await session!.listTables(in: "mydb")
+            let tables = try await activeSession.listTables(in: "mydb")
             for table in tables {
                 print("   - \(table.name) (\(table.kind))")
             }

@@ -121,4 +121,6 @@ uninstall:
 	fi
 	@if [ -d "$(APP_BUNDLE)" ]; then \
 		rm -rf "$(APP_BUNDLE)" && echo "Removed $(APP_BUNDLE)"; \
+	else \
+		echo "No app bundle found at $(APP_BUNDLE)"; \
 	fi
