@@ -95,13 +95,16 @@ public final class PostgreSQLDriver: DatabaseDriver, @unchecked Sendable {
             tls: .disable
         )
 
-        let connection = try await PostgresConnection.connect(
-            configuration: config,
-            id: 1,
-            logger: logger
-        )
-
-        return PostgreSQLSession(profile: profile, connection: connection)
+        do {
+            let connection = try await PostgresConnection.connect(
+                configuration: config,
+                id: 1,
+                logger: logger
+            )
+            return PostgreSQLSession(profile: profile, connection: connection)
+        } catch {
+            throw DatabaseDriverError.connectionFailed(reason: "PostgreSQL接続に失敗しました: \(error.localizedDescription)")
+        }
     }
 
     private func getPassword(from credential: CredentialReference) -> String? {
@@ -173,17 +176,20 @@ public final class MySQLDriver: DatabaseDriver, @unchecked Sendable {
         var logger = Logger(label: "db-viewer.mysql")
         logger.logLevel = .error
 
-        let connection = try await MySQLConnection.connect(
-            to: .makeAddressResolvingHost(profile.host, port: profile.port),
-            username: profile.username,
-            database: profile.database,
-            password: password ?? "",
-            tlsConfiguration: nil,
-            logger: logger,
-            on: eventLoopGroup.next()
-        ).get()
-
-        return MySQLSession(profile: profile, connection: connection, logger: logger)
+        do {
+            let connection = try await MySQLConnection.connect(
+                to: .makeAddressResolvingHost(profile.host, port: profile.port),
+                username: profile.username,
+                database: profile.database,
+                password: password ?? "",
+                tlsConfiguration: nil,
+                logger: logger,
+                on: eventLoopGroup.next()
+            ).get()
+            return MySQLSession(profile: profile, connection: connection, logger: logger)
+        } catch {
+            throw DatabaseDriverError.connectionFailed(reason: "MySQL接続に失敗しました: \(error.localizedDescription)")
+        }
     }
 
     private func getPassword(from credential: CredentialReference) -> String? {

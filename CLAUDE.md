@@ -1,4 +1,5 @@
 必ず回答は日本語でお願いします
+操作はMakefileで定義してください。
 
 # CLAUDE.md
 
@@ -10,24 +11,34 @@ DB Viewer is a macOS database viewer application supporting PostgreSQL, MySQL, a
 
 ## Building and Running
 
+すべての操作はMakefileで定義されています。`make help`で利用可能なコマンドを確認できます。
+
 ### Build the project
 ```bash
-swift build
+make build      # Debugビルド
+make release    # Releaseビルド
 ```
 
 ### Run the main application
 ```bash
-swift run db-viewer
-```
-
-### Run the backup demo
-```bash
-swift run backup-demo
+make run
 ```
 
 ### Run tests
 ```bash
-swift test
+make test
+```
+
+### Create macOS app bundle
+```bash
+make app        # build/DBViewer.app を作成
+make install    # /Applications にインストール
+make uninstall  # アンインストール
+```
+
+### Clean build artifacts
+```bash
+make clean
 ```
 
 ## Architecture
@@ -46,10 +57,9 @@ Core business logic and database drivers. Key components:
   - Backup generation (`generateBackupSQL()`)
 
 - **Driver implementations**:
-  - `PostgreSQLDriver`, `MySQLDriver`, `SQLiteDriver` in `RealDatabaseDrivers.swift`
+  - `PostgreSQLDriver` (PostgresNIO), `MySQLDriver` (MySQLNIO), `SQLiteDriver` (SQLite3 C API) in `RealDatabaseDrivers.swift`
   - `InMemoryDriver` in `StubDrivers.swift` (for testing/preview)
-  - SQLite is the only fully functional driver using SQLite3 C API
-  - PostgreSQL and MySQL drivers currently return sample data
+  - All drivers support real database connections
 
 - **ConnectionStore**: Manages saved database connections
   - `FileConnectionStore`: Production implementation using AES-GCM encryption
@@ -114,8 +124,9 @@ The backup functionality is implemented as an extension on `DatabaseSession` in 
 
 ## Current Limitations
 
-- PostgreSQL and MySQL drivers (`RealDatabaseDrivers.swift`) are placeholder implementations returning sample data
-- Only SQLite driver has full functionality using the SQLite3 C API
+- PostgreSQL driver uses PostgresNIO for real database connections
+- MySQL driver uses MySQLNIO for real database connections
+- SQLite driver uses SQLite3 C API
 - BackupDemo target exists but has no implementation
 - No actual tests in Tests directory (DatabaseModelsTests.swift was deleted)
 
