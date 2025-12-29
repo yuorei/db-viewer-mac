@@ -1,6 +1,6 @@
 import Foundation
 
-public enum DatabaseDriverError: Error, Sendable, Equatable {
+public enum DatabaseDriverError: Error, Sendable, Equatable, LocalizedError {
     case unsupported
     case connectionFailed(reason: String)
     case authenticationFailed
@@ -8,6 +8,25 @@ public enum DatabaseDriverError: Error, Sendable, Equatable {
     case notFound
     case optimisticLockFailed
     case transactionConflict
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupported:
+            return "この操作はサポートされていません"
+        case .connectionFailed(let reason):
+            return "接続に失敗しました: \(reason)"
+        case .authenticationFailed:
+            return "認証に失敗しました"
+        case .queryFailed(let reason):
+            return "クエリに失敗しました: \(reason)"
+        case .notFound:
+            return "見つかりません"
+        case .optimisticLockFailed:
+            return "データが他のユーザーによって変更されました"
+        case .transactionConflict:
+            return "トランザクションの競合が発生しました"
+        }
+    }
 }
 
 public struct DataQueryRequest: Sendable, Equatable {
