@@ -43,7 +43,7 @@ make clean
 
 ## Architecture
 
-The codebase is organized into three main modules:
+The codebase is organized into two main modules:
 
 ### DBViewerCore (library)
 Core business logic and database drivers. Key components:
@@ -89,8 +89,10 @@ Key view models:
 - `SQLConsoleViewModel`: Executes raw SQL queries
 - `RowEditorViewModel`: Inline row editing
 
-### BackupDemo (executable)
-Demonstration of backup functionality (executable target defined but no source files currently exist).
+### Test Executables
+Additional executable targets for database connection testing:
+- `PostgresTest`: PostgreSQL connection testing utility
+- `MySQLTest`: MySQL connection testing utility
 
 ## Key Design Patterns
 
@@ -122,13 +124,11 @@ The backup functionality is implemented as an extension on `DatabaseSession` in 
 - Handles multiple schemas and data types
 - Output format includes metadata header with connection info and timestamp
 
-## Current Limitations
+## Testing
 
-- PostgreSQL driver uses PostgresNIO for real database connections
-- MySQL driver uses MySQLNIO for real database connections
-- SQLite driver uses SQLite3 C API
-- BackupDemo target exists but has no implementation
-- No actual tests in Tests directory (DatabaseModelsTests.swift was deleted)
+- `PostgresTest` and `MySQLTest` executables provide connection testing utilities
+- No formal test suite currently exists (no Tests directory)
+- Testing primarily done through preview data and manual testing with real databases
 
 ## Database Engine Support
 
